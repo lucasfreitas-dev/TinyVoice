@@ -1,0 +1,108 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tinyvoice}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tinyvoice}
+      POSTGRES_DB: ${POSTGRES_DB:-tinyvoice}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tinyvoice}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-tinyvoice}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-tinyvoice}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+
+  evolution:
+    image: evoapicloud/evolution-api:v2.3.6
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      SERVER_URL: ${TINYVOICE_PUBLIC_URL:-http://localhost}
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY:-change-me-evolution-key}
+      DATABASE_ENABLED: "true"
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: postgres://${POSTGRES_USER:-tinyvoice}:${POSTGRES_PASSWORD:-tinyvoice}@postgres:5432/evolution?sslmode=disable
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: redis://redis:6379
+      WEBHOOK_GLOBAL_ENABLED: "false"
+    volumes:
+      - evolution_data:/evolution/instances
+
+  tinyvoice-api:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-tinyvoice}:${POSTGRES_PASSWORD:-tinyvoice}@postgres:5432/${POSTGRES_DB:-tinyvoice}?sslmode=disable
+      API_PORT: "8080"
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-change-me-admin-token}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-tinyvoice}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-tinyvoice}
+      MINIO_BUCKET: ${MINIO_BUCKET:-tinyvoice-audio}
+      MINIO_USE_SSL: "false"
+      EVOLUTION_BASE_URL: http://evolution:8080
+      EVOLUTION_API_KEY: ${EVOLUTION_API_KEY:-change-me-evolution-key}
+      EVOLUTION_INSTANCE: ${EVOLUTION_INSTANCE:-tinyvoice}
+      EVOLUTION_WEBHOOK_SECRET: ${EVOLUTION_WEBHOOK_SECRET:-change-me-webhook-secret}
+      TINYVOICE_PUBLIC_URL: ${TINYVOICE_PUBLIC_URL:-http://localhost}
+      WORKER_POLL_INTERVAL: ${WORKER_POLL_INTERVAL:-5s}
+      WORKER_MAX_ATTEMPTS: ${WORKER_MAX_ATTEMPTS:-5}
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - tinyvoice-api
+      - evolution
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  postgres_data:
+  minio_data:
+  redis_data:
+  evolution_data:
+  caddy_data:
+  caddy_config:
