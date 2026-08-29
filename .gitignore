@@ -1,0 +1,13 @@
+.env
+*.local
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.o
+*.elf
+*.bin
+.pio/
+firmware/tinyvoice/include/config.h
+backend/tmp/
+*.test
