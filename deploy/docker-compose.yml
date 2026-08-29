@@ -14,6 +14,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    ports:
+      - "5432:5432"
 
   minio:
     image: minio/minio:latest
@@ -45,7 +47,7 @@ services:
       redis:
         condition: service_started
     environment:
-      SERVER_URL: ${TINYVOICE_PUBLIC_URL:-http://localhost}
+      SERVER_URL: ${EVOLUTION_PUBLIC_URL:-http://localhost}
       AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY:-change-me-evolution-key}
       DATABASE_ENABLED: "true"
       DATABASE_PROVIDER: postgresql

@@ -55,7 +55,7 @@ func ValidateWAV(r io.Reader, maxBytes int64) (*WAVInfo, error) {
 
 func ConvertToOpus(inputPath, outputPath string) error {
 	cmd := exec.Command("ffmpeg", "-y", "-i", inputPath,
-		"-c:a", "libopus", "-b:a", "32k", "-vbr", "on",
+		"-c:a", "libopus", "-b:a", "64k", "-vbr", "on",
 		"-ac", "1", "-ar", "16000", outputPath)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {

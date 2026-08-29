@@ -2,6 +2,8 @@
 #include "config.h"
 #include <WiFi.h>
 
+static unsigned long s_lastReconnectMs = 0;
+
 void WiFiManager::begin() {
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
@@ -24,9 +26,15 @@ bool WiFiManager::isConnected() {
 }
 
 void WiFiManager::reconnect() {
-    if (!isConnected()) {
-        connect();
+    if (isConnected()) {
+        return;
     }
+    unsigned long now = millis();
+    if (now - s_lastReconnectMs < 5000) {
+        return;
+    }
+    s_lastReconnectMs = now;
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
 void WiFiManager::loop() {

@@ -26,6 +26,7 @@ public:
     void onWiFiFailed();
     void onButtonHoldStart();
     void onButtonRelease();
+    void onUploadStart();
     void onButtonShortPress();
     void onPollStart();
     void onPollComplete(bool messageAvailable);

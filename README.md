@@ -37,7 +37,7 @@ Migrations run automatically when `tinyvoice-api` starts.
 
 ### 5. Configure Evolution API
 
-1. Open Evolution manager or API at `http://localhost/evolution/`
+1. Open Evolution manager at `http://localhost/manager` (or API at `http://localhost/evolution/`)
 2. Create instance named `tinyvoice` (or match `EVOLUTION_INSTANCE` in `.env`)
 3. Scan QR code with the dedicated WhatsApp account
 
@@ -45,6 +45,7 @@ Migrations run automatically when `tinyvoice-api` starts.
 
 ```bash
 export ADMIN_TOKEN=change-me-admin-token
+# Use localhost (not postgres) when running the CLI on your host machine
 export DATABASE_URL=postgres://tinyvoice:change-me-postgres@localhost:5432/tinyvoice?sslmode=disable
 
 # Build CLI locally or use docker exec:

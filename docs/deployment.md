@@ -24,7 +24,8 @@ Edit `.env`:
 | `EVOLUTION_API_KEY` | Evolution API key |
 | `EVOLUTION_INSTANCE` | WhatsApp instance name |
 | `EVOLUTION_WEBHOOK_SECRET` | Webhook auth header |
-| `TINYVOICE_PUBLIC_URL` | Public URL for Evolution |
+| `TINYVOICE_PUBLIC_URL` | Public URL for TinyVoice API |
+| `EVOLUTION_PUBLIC_URL` | Public base URL for Evolution (manager at `/manager` on this host) |
 
 ## Start Stack
 
@@ -53,7 +54,7 @@ Caddy obtains TLS certificates automatically.
 
 ## Evolution WhatsApp Setup
 
-1. Access Evolution at `https://your-domain/evolution/` (or port 8080 internally)
+1. Access Evolution manager at `https://your-domain/manager` (API welcome page at `/evolution/`)
 2. Create instance matching `EVOLUTION_INSTANCE`
 3. Set webhook URL: `https://your-domain/api/v1/webhooks/evolution`
 4. Enable event: `MESSAGES_UPSERT`

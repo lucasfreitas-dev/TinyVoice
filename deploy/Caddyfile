@@ -1,26 +1,37 @@
-{
-	# Replace with your domain for production HTTPS
-	# localhost {
-	# 	tls internal
-	# }
+# Replace with your domain for production HTTPS
+# localhost {
+# 	tls internal
+# }
 
-	:80 {
-		handle /api/* {
-			reverse_proxy tinyvoice-api:8080
-		}
+:80 {
+	handle /api/* {
+		reverse_proxy tinyvoice-api:8080
+	}
 
-		handle /health {
-			reverse_proxy tinyvoice-api:8080
-		}
+	handle /health {
+		reverse_proxy tinyvoice-api:8080
+	}
 
-		handle /evolution/* {
-			uri strip_prefix /evolution
-			reverse_proxy evolution:8080
-		}
+	# Evolution manager UI and API (must be at root — Evolution ignores path prefixes)
+	handle /manager/* {
+		reverse_proxy evolution:8080
+	}
 
-		handle {
-			respond "TinyVoice API" 200
-		}
+	handle /assets/* {
+		reverse_proxy evolution:8080
+	}
+
+	handle /instance/* {
+		reverse_proxy evolution:8080
+	}
+
+	handle /evolution/* {
+		uri strip_prefix /evolution
+		reverse_proxy evolution:8080
+	}
+
+	handle {
+		respond "TinyVoice API" 200
 	}
 }
 

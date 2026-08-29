@@ -48,13 +48,21 @@ void StateMachine::onWiFiFailed() {
 }
 
 void StateMachine::onButtonHoldStart() {
-    if (_state == DeviceState::IDLE && !_hasPendingMessage) {
+    if (_state == DeviceState::IDLE ||
+        _state == DeviceState::CHECKING_MESSAGES ||
+        _state == DeviceState::ERROR) {
         transition(DeviceState::RECORDING);
     }
 }
 
 void StateMachine::onButtonRelease() {
     if (_state == DeviceState::RECORDING) {
+        transition(DeviceState::UPLOADING);
+    }
+}
+
+void StateMachine::onUploadStart() {
+    if (_state == DeviceState::IDLE) {
         transition(DeviceState::UPLOADING);
     }
 }
