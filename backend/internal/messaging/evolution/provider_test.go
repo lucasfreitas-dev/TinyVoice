@@ -13,8 +13,8 @@ func TestNewProvider(t *testing.T) {
 }
 
 func TestSplitMessageRef(t *testing.T) {
-	parts := strings.SplitN("abc|5511@s.whatsapp.net", "|", 2)
-	if parts[0] != "abc" || parts[1] != "5511@s.whatsapp.net" {
+	parts := strings.SplitN("abc|5511000000001@s.whatsapp.net", "|", 2)
+	if parts[0] != "abc" || parts[1] != "5511000000001@s.whatsapp.net" {
 		t.Fatal("split failed")
 	}
 }

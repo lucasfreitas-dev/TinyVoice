@@ -49,8 +49,8 @@ export ADMIN_TOKEN=change-me-admin-token
 export DATABASE_URL=postgres://tinyvoice:change-me-postgres@localhost:5432/tinyvoice?sslmode=disable
 
 # Build CLI locally or use docker exec:
-cd backend && go run ./cmd/tinyvoice device create --name "Caixa do João"
-cd backend && go run ./cmd/tinyvoice conversation create --name "João e Pai" --recipient "5511999999999"
+cd backend && go run ./cmd/tinyvoice device create --name "My Box"
+cd backend && go run ./cmd/tinyvoice conversation create --name "Family" --recipient "5511000000001"
 cd backend && go run ./cmd/tinyvoice device bind --device <device-id> --conversation <conversation-id>
 ```
 
@@ -88,6 +88,10 @@ docs/             Documentation
 ## Development
 
 See [docs/development.md](docs/development.md).
+
+## Production (VPS)
+
+Deploy with HTTPS on your own domain — see [docs/deployment.md](docs/deployment.md#vps-production).
 
 ## License
 

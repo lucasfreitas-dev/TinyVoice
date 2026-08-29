@@ -30,7 +30,7 @@ export DATABASE_URL=postgres://...
 
 go run ./cmd/tinyvoice device create --name "Test Device"
 go run ./cmd/tinyvoice device list
-go run ./cmd/tinyvoice conversation create --name "Test" --recipient "5511999999999"
+go run ./cmd/tinyvoice conversation create --name "Test" --recipient "5511000000001"
 go run ./cmd/tinyvoice device bind --device <uuid> --conversation <uuid>
 ```
 

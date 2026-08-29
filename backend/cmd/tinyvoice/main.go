@@ -175,7 +175,7 @@ func conversationCreateCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "Conversation name")
-	cmd.Flags().StringVar(&recipient, "recipient", "", "WhatsApp recipient number e.g. 5511999999999")
+	cmd.Flags().StringVar(&recipient, "recipient", "", "WhatsApp recipient number e.g. 5511000000001")
 	return cmd
 }
 

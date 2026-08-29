@@ -65,13 +65,19 @@ func main() {
 
 	msgSvc := message.NewService(msgRepo, deviceRepo, convRepo, store)
 
+	var evolutionClient *evolution.Client
+	if cfg.EvolutionAPIKey != "" {
+		evolutionClient = evolution.NewClient(cfg.EvolutionBaseURL, cfg.EvolutionAPIKey, cfg.EvolutionInstance)
+	}
+
 	router := api.NewRouter(api.Deps{
-		Devices:       deviceSvc,
-		DeviceRepo:    deviceRepo,
-		Messages:      msgSvc,
-		Storage:       store,
-		Logger:        logger,
-		WebhookSecret: cfg.EvolutionWebhookSecret,
+		Devices:         deviceSvc,
+		DeviceRepo:      deviceRepo,
+		Messages:        msgSvc,
+		Storage:         store,
+		EvolutionClient: evolutionClient,
+		Logger:          logger,
+		WebhookSecret:   cfg.EvolutionWebhookSecret,
 	})
 
 	if cfg.EvolutionAPIKey != "" {

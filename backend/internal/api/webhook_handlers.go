@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,10 +19,15 @@ import (
 	"tinyvoice/backend/internal/storage"
 )
 
+type evolutionMediaClient interface {
+	GetBase64FromMediaMessage(ctx context.Context, messageID, remoteJid string) ([]byte, string, error)
+}
+
 type WebhookHandlers struct {
 	messages  *message.Service
 	devices   *device.Repository
 	storage   storage.Provider
+	evolution evolutionMediaClient
 	secret    string
 	logger    *slog.Logger
 }
@@ -29,15 +36,17 @@ func NewWebhookHandlers(
 	messages *message.Service,
 	devices *device.Repository,
 	storage storage.Provider,
+	evolutionClient evolutionMediaClient,
 	secret string,
 	logger *slog.Logger,
 ) *WebhookHandlers {
 	return &WebhookHandlers{
-		messages: messages,
-		devices:  devices,
-		storage:  storage,
-		secret:   secret,
-		logger:   logger,
+		messages:  messages,
+		devices:   devices,
+		storage:   storage,
+		evolution: evolutionClient,
+		secret:    secret,
+		logger:    logger,
 	}
 }
 
@@ -46,9 +55,11 @@ type evolutionWebhook struct {
 	Instance string `json:"instance"`
 	Data     struct {
 		Key struct {
-			ID        string `json:"id"`
-			RemoteJid string `json:"remoteJid"`
-			FromMe    bool   `json:"fromMe"`
+			ID           string `json:"id"`
+			RemoteJid    string `json:"remoteJid"`
+			RemoteJidAlt string `json:"remoteJidAlt"`
+			SenderPn     string `json:"senderPn"`
+			FromMe       bool   `json:"fromMe"`
 		} `json:"key"`
 		Message struct {
 			AudioMessage *struct {
@@ -112,15 +123,19 @@ func (h *WebhookHandlers) Evolution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	recipient := normalizePhone(payload.Data.Key.RemoteJid)
+	recipient := resolveRecipient(payload.Data.Key.RemoteJid, payload.Data.Key.RemoteJidAlt, payload.Data.Key.SenderPn)
 	deviceID, convID, err := h.devices.FindByRecipient(r.Context(), recipient)
 	if err != nil {
-		h.logger.Error("webhook_no_device", slog.String("recipient", recipient))
+		h.logger.Error("webhook_no_device",
+			slog.String("recipient", recipient),
+			slog.String("remote_jid", payload.Data.Key.RemoteJid),
+			slog.String("remote_jid_alt", payload.Data.Key.RemoteJidAlt),
+		)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	audioData, _, err := h.downloadInboundAudio(payload)
+	audioData, mime, err := h.downloadInboundAudio(r.Context(), payload)
 	if err != nil {
 		h.logger.Error("whatsapp_error", slog.String("error", err.Error()))
 		http.Error(w, `{"error":"download failed"}`, http.StatusInternalServerError)
@@ -132,7 +147,7 @@ func (h *WebhookHandlers) Evolution(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	tmpIn, err := os.CreateTemp("", "inbound-*")
+	tmpIn, err := os.CreateTemp("", "inbound-*"+inboundExt(mime))
 	if err != nil {
 		http.Error(w, `{"error":"temp file"}`, http.StatusInternalServerError)
 		return
@@ -212,7 +227,35 @@ func normalizePhone(remoteJid string) string {
 	return p
 }
 
-func (h *WebhookHandlers) downloadInboundAudio(payload evolutionWebhook) (io.Reader, string, error) {
+func resolveRecipient(remoteJid, remoteJidAlt, senderPn string) string {
+	if strings.Contains(remoteJid, "@lid") {
+		if remoteJidAlt != "" {
+			return normalizePhone(remoteJidAlt)
+		}
+		if senderPn != "" {
+			return normalizePhone(senderPn)
+		}
+	}
+	return normalizePhone(remoteJid)
+}
+
+func (h *WebhookHandlers) downloadInboundAudio(ctx context.Context, payload evolutionWebhook) (io.Reader, string, error) {
+	if h.evolution != nil && payload.Data.Key.ID != "" && payload.Data.Key.RemoteJid != "" {
+		data, mime, err := h.evolution.GetBase64FromMediaMessage(
+			ctx,
+			payload.Data.Key.ID,
+			payload.Data.Key.RemoteJid,
+		)
+		if err != nil {
+			h.logger.Warn("evolution_media_download_failed", slog.String("error", err.Error()))
+		} else if len(data) > 0 {
+			if mime == "" && payload.Data.Message.AudioMessage != nil {
+				mime = payload.Data.Message.AudioMessage.Mimetype
+			}
+			return bytes.NewReader(data), mime, nil
+		}
+	}
+
 	if payload.Data.Message.AudioMessage != nil && payload.Data.Message.AudioMessage.URL != "" {
 		resp, err := http.Get(payload.Data.Message.AudioMessage.URL)
 		if err != nil {
@@ -225,5 +268,18 @@ func (h *WebhookHandlers) downloadInboundAudio(payload evolutionWebhook) (io.Rea
 		mime := payload.Data.Message.AudioMessage.Mimetype
 		return resp.Body, mime, nil
 	}
-	return nil, "", fmt.Errorf("no audio url in payload")
+	return nil, "", fmt.Errorf("no audio in payload")
+}
+
+func inboundExt(mime string) string {
+	switch {
+	case strings.Contains(mime, "ogg"):
+		return ".ogg"
+	case strings.Contains(mime, "mpeg"), strings.Contains(mime, "mp3"):
+		return ".mp3"
+	case strings.Contains(mime, "mp4"), strings.Contains(mime, "m4a"):
+		return ".m4a"
+	default:
+		return ".bin"
+	}
 }

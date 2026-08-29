@@ -1,9 +1,7 @@
-# Replace with your domain for production HTTPS
-# localhost {
-# 	tls internal
-# }
+# Production — replace tinyvoice.example.com with your domain, then:
+#   cp Caddyfile.prod Caddyfile
 
-:80 {
+tinyvoice.example.com {
 	handle /api/* {
 		reverse_proxy tinyvoice-api:8080
 	}
@@ -38,12 +36,3 @@
 		respond "TinyVoice API" 200
 	}
 }
-
-# Production example (uncomment and set domain):
-# tinyvoice.example.com {
-#     reverse_proxy /api/* tinyvoice-api:8080
-#     reverse_proxy /health tinyvoice-api:8080
-#     handle_path /evolution/* {
-#         reverse_proxy evolution:8080
-#     }
-# }
