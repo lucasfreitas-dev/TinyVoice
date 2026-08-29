@@ -8,6 +8,7 @@ public:
     bool begin();
     void playBootChime();
     bool play(const uint8_t* wavData, size_t len);
+    bool playFile(const char* path);
     bool isPlaying() const;
     void loop();
 

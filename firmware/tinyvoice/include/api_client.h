@@ -17,7 +17,7 @@ public:
     bool uploadAudio(const uint8_t* data, size_t len);
     bool uploadAudioFile(const char* path);
     bool uploadRecording(const uint8_t* wavHeader, size_t pcmBytes, int chunkCount);
-    bool downloadAudio(const char* messageId, uint8_t** outData, size_t* outLen);
+    bool downloadAudioToFile(const char* messageId, const char* path);
     bool markPlayed(const char* messageId);
 
 private:

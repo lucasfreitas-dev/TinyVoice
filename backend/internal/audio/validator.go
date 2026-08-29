@@ -21,24 +21,19 @@ type WAVInfo struct {
 }
 
 func ValidateWAV(r io.Reader, maxBytes int64) (*WAVInfo, error) {
-	const headerSize = 44
-	header := make([]byte, headerSize)
-	n, err := io.ReadFull(r, header)
+	byteRate, dataSize, riffSize, err := parseWAVHeader(r)
 	if err != nil {
-		return nil, fmt.Errorf("read wav header: %w", err)
+		return nil, err
 	}
-	if n < headerSize || string(header[0:4]) != "RIFF" || string(header[8:12]) != "WAVE" {
-		return nil, fmt.Errorf("invalid wav format")
-	}
-
-	dataSize := binary.LittleEndian.Uint32(header[40:44])
-	byteRate := binary.LittleEndian.Uint32(header[28:32])
 	if byteRate == 0 {
 		return nil, fmt.Errorf("invalid wav byte rate")
 	}
+	if dataSize == 0 {
+		return nil, fmt.Errorf("missing wav data chunk")
+	}
 
 	durationMs := int(dataSize) * 1000 / int(byteRate)
-	sizeBytes := int64(dataSize) + headerSize
+	sizeBytes := int64(riffSize) + 8 // RIFF header is 8 bytes + chunk payload size
 
 	if durationMs < MinDurationMs {
 		return nil, fmt.Errorf("recording too short: %dms (min %dms)", durationMs, MinDurationMs)
@@ -51,6 +46,51 @@ func ValidateWAV(r io.Reader, maxBytes int64) (*WAVInfo, error) {
 	}
 
 	return &WAVInfo{DurationMs: durationMs, SizeBytes: sizeBytes}, nil
+}
+
+func parseWAVHeader(r io.Reader) (byteRate, dataSize, riffSize uint32, err error) {
+	var riff [12]byte
+	if _, err = io.ReadFull(r, riff[:]); err != nil {
+		return 0, 0, 0, fmt.Errorf("read wav header: %w", err)
+	}
+	if string(riff[0:4]) != "RIFF" || string(riff[8:12]) != "WAVE" {
+		return 0, 0, 0, fmt.Errorf("invalid wav format")
+	}
+	riffSize = binary.LittleEndian.Uint32(riff[4:8])
+
+	for {
+		var chunkHeader [8]byte
+		if _, err = io.ReadFull(r, chunkHeader[:]); err != nil {
+			return 0, 0, 0, fmt.Errorf("read wav chunk: %w", err)
+		}
+
+		chunkID := string(chunkHeader[0:4])
+		chunkSize := binary.LittleEndian.Uint32(chunkHeader[4:8])
+
+		switch chunkID {
+		case "fmt ":
+			fmtChunk := make([]byte, chunkSize)
+			if _, err = io.ReadFull(r, fmtChunk); err != nil {
+				return 0, 0, 0, fmt.Errorf("read fmt chunk: %w", err)
+			}
+			if len(fmtChunk) >= 12 {
+				byteRate = binary.LittleEndian.Uint32(fmtChunk[8:12])
+			}
+		case "data":
+			dataSize = chunkSize
+			return byteRate, dataSize, riffSize, nil
+		default:
+			if _, err = io.CopyN(io.Discard, r, int64(chunkSize)); err != nil {
+				return 0, 0, 0, fmt.Errorf("skip chunk %q: %w", chunkID, err)
+			}
+		}
+
+		if chunkSize%2 == 1 {
+			if _, err = io.CopyN(io.Discard, r, 1); err != nil {
+				return 0, 0, 0, fmt.Errorf("skip chunk padding: %w", err)
+			}
+		}
+	}
 }
 
 func ConvertToOpus(inputPath, outputPath string) error {

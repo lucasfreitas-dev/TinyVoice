@@ -55,10 +55,23 @@ void configureHttp(HTTPClient& http) {
     http.setReuse(false);
 }
 
+void configureHttpDownload(HTTPClient& http) {
+    http.setConnectTimeout(5000);
+    http.setTimeout(30000);
+    http.setReuse(false);
+}
+
 void configureHttpUpload(HTTPClient& http) {
     http.setConnectTimeout(5000);
     http.setTimeout(API_TIMEOUT_MS);
     http.setReuse(false);
+}
+
+bool beginDownloadRequest(HTTPClient& http, WiFiClient& client, const char* path) {
+    ApiEndpoint ep = parseEndpoint(path);
+    configureHttpDownload(http);
+    Serial.printf("api: %s:%u%s\n", ep.host.c_str(), ep.port, ep.uri.c_str());
+    return http.begin(client, ep.host, ep.port, ep.uri);
 }
 
 bool beginRequest(HTTPClient& http, WiFiClient& client, const char* path, bool forUpload) {
@@ -497,11 +510,11 @@ bool ApiClient::uploadRecording(const uint8_t* wavHeader, size_t pcmBytes, int c
     return code == 201 || code == 200;
 }
 
-bool ApiClient::downloadAudio(const char* messageId, uint8_t** outData, size_t* outLen) {
+bool ApiClient::downloadAudioToFile(const char* messageId, const char* path) {
     WiFiClient client;
     HTTPClient http;
-    String path = String("/api/v1/device/messages/") + messageId + "/audio";
-    if (!beginRequest(http, client, path.c_str())) {
+    String apiPath = String("/api/v1/device/messages/") + messageId + "/audio";
+    if (!beginDownloadRequest(http, client, apiPath.c_str())) {
         return false;
     }
     setAuth(http);
@@ -513,33 +526,56 @@ bool ApiClient::downloadAudio(const char* messageId, uint8_t** outData, size_t* 
     }
 
     int len = http.getSize();
-    if (len <= 0) {
-        http.end();
-        return false;
-    }
+    Serial.printf("download: expected=%d heap=%u\n", len, ESP.getFreeHeap());
 
-    uint8_t* buf = (uint8_t*)malloc(len);
-    if (!buf) {
+    if (LittleFS.exists(path)) {
+        LittleFS.remove(path);
+    }
+    File out = LittleFS.open(path, FILE_WRITE);
+    if (!out) {
+        Serial.println("download: open failed");
         http.end();
         return false;
     }
 
     WiFiClient* stream = http.getStreamPtr();
+    uint8_t buf[4096];
     size_t pos = 0;
-    while (http.connected() && pos < (size_t)len) {
-        size_t avail = stream->available();
-        if (avail) {
-            int read = stream->readBytes(buf + pos, avail);
-            pos += read;
-        } else {
-            delay(1);
+    unsigned long deadline = millis() + 30000;
+
+    while (millis() < deadline) {
+        if (len > 0 && pos >= (size_t)len) {
+            break;
         }
+        if (!stream->available()) {
+            if (!http.connected() && !stream->available()) {
+                break;
+            }
+            delay(1);
+            continue;
+        }
+
+        size_t toRead = stream->available();
+        if (toRead > sizeof(buf)) {
+            toRead = sizeof(buf);
+        }
+        if (len > 0 && pos + toRead > (size_t)len) {
+            toRead = (size_t)len - pos;
+        }
+
+        int read = stream->readBytes(buf, toRead);
+        if (read <= 0) {
+            break;
+        }
+        out.write(buf, read);
+        pos += read;
     }
+
+    out.close();
     http.end();
 
-    *outData = buf;
-    *outLen = pos;
-    return pos > 0;
+    Serial.printf("download: saved %u bytes\n", (unsigned)pos);
+    return pos > 44;
 }
 
 bool ApiClient::markPlayed(const char* messageId) {

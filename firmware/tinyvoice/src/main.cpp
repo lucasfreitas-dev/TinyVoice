@@ -317,11 +317,11 @@ void handleRecording() {
     }
 }
 
-void handleDownloadAndPlay() {
-    uint8_t* audio = nullptr;
-    size_t audioLen = 0;
+static const char* INBOUND_PLAY_PATH = "/play.wav";
 
-    if (!apiClient.downloadAudio(pendingMessageId, &audio, &audioLen)) {
+void handleDownloadAndPlay() {
+    if (!apiClient.downloadAudioToFile(pendingMessageId, INBOUND_PLAY_PATH)) {
+        Serial.println("download: failed");
         stateMachine.onDownloadFailed();
         led.update(stateMachine.current(), stateMachine.hasPendingMessage());
         return;
@@ -330,8 +330,10 @@ void handleDownloadAndPlay() {
     stateMachine.onDownloadComplete();
     led.update(stateMachine.current(), stateMachine.hasPendingMessage());
 
-    audioPlayer.play(audio, audioLen);
-    free(audio);
+    if (!audioPlayer.playFile(INBOUND_PLAY_PATH)) {
+        Serial.println("audio: playback failed");
+    }
+    LittleFS.remove(INBOUND_PLAY_PATH);
 
     apiClient.markPlayed(pendingMessageId);
     pendingMessageId[0] = '\0';

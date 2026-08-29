@@ -1,13 +1,42 @@
 #include "audio_player.h"
 #include "pins.h"
 #include <Arduino.h>
+#include <LittleFS.h>
 #include <driver/i2s.h>
 #include <math.h>
+#include <string.h>
 
 static const int SAMPLE_RATE = 16000;
 static const i2s_port_t I2S_SPK = I2S_NUM_1;
 
 static AudioPins pins;
+
+static size_t findWavPcmOffset(const uint8_t* wavData, size_t len) {
+    if (len < 12 || memcmp(wavData, "RIFF", 4) != 0 || memcmp(wavData + 8, "WAVE", 4) != 0) {
+        return 0;
+    }
+
+    size_t pos = 12;
+    while (pos + 8 <= len) {
+        const uint8_t* chunkId = wavData + pos;
+        uint32_t chunkSize = (uint32_t)chunkId[4]
+            | ((uint32_t)chunkId[5] << 8)
+            | ((uint32_t)chunkId[6] << 16)
+            | ((uint32_t)chunkId[7] << 24);
+        pos += 8;
+        if (memcmp(chunkId, "data", 4) == 0) {
+            return pos;
+        }
+        if (pos + chunkSize > len) {
+            return 0;
+        }
+        pos += chunkSize;
+        if (chunkSize % 2 == 1) {
+            pos++;
+        }
+    }
+    return 0;
+}
 
 bool AudioPlayer::begin() {
     i2s_config_t cfg = {
@@ -90,8 +119,14 @@ void AudioPlayer::playBootChime() {
 bool AudioPlayer::play(const uint8_t* wavData, size_t len) {
     if (!_ready || len <= 44) return false;
 
-    const uint8_t* pcm = wavData + 44;
-    size_t pcmLen = len - 44;
+    size_t offset = findWavPcmOffset(wavData, len);
+    if (offset == 0) {
+        Serial.println("audio: invalid wav header");
+        return false;
+    }
+
+    const uint8_t* pcm = wavData + offset;
+    size_t pcmLen = len - offset;
     size_t written = 0;
 
     _playing = true;
@@ -103,7 +138,55 @@ bool AudioPlayer::play(const uint8_t* wavData, size_t len) {
         written += bytesWritten;
     }
     _playing = false;
+    Serial.printf("audio: played %u pcm bytes\n", (unsigned)pcmLen);
     return true;
+}
+
+bool AudioPlayer::playFile(const char* path) {
+    if (!_ready) return false;
+
+    File f = LittleFS.open(path, FILE_READ);
+    if (!f) {
+        Serial.println("audio: open failed");
+        return false;
+    }
+
+    uint8_t header[256];
+    size_t headerLen = f.read(header, sizeof(header));
+    size_t offset = findWavPcmOffset(header, headerLen);
+    if (offset == 0) {
+        Serial.println("audio: invalid wav header");
+        f.close();
+        return false;
+    }
+
+    size_t pcmLen = f.size() - offset;
+    if (!f.seek(offset)) {
+        Serial.println("audio: seek failed");
+        f.close();
+        return false;
+    }
+
+    uint8_t buf[512];
+    size_t written = 0;
+    _playing = true;
+    while (written < pcmLen) {
+        size_t toRead = pcmLen - written;
+        if (toRead > sizeof(buf)) {
+            toRead = sizeof(buf);
+        }
+        size_t n = f.read(buf, toRead);
+        if (n == 0) {
+            break;
+        }
+        size_t bytesWritten = 0;
+        i2s_write(I2S_SPK, buf, n, &bytesWritten, portMAX_DELAY);
+        written += n;
+    }
+    f.close();
+    _playing = false;
+    Serial.printf("audio: played %u pcm bytes from file\n", (unsigned)written);
+    return written > 0;
 }
 
 bool AudioPlayer::isPlaying() const { return _playing; }
