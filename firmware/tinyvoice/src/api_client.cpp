@@ -3,6 +3,7 @@
 #include "storage_lock.h"
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <LittleFS.h>
 #include <cstring>
 #include <HTTPClient.h>
@@ -13,11 +14,17 @@ struct ApiEndpoint {
     String host;
     uint16_t port;
     String uri;
+    bool tls;
 };
+
+bool apiUsesTls() {
+    return String(API_BASE_URL).startsWith("https://");
+}
 
 ApiEndpoint parseEndpoint(const char* path) {
     ApiEndpoint ep;
     ep.port = 80;
+    ep.tls = false;
 
     String base = API_BASE_URL;
     if (base.startsWith("http://")) {
@@ -25,6 +32,7 @@ ApiEndpoint parseEndpoint(const char* path) {
     } else if (base.startsWith("https://")) {
         base.remove(0, 8);
         ep.port = 443;
+        ep.tls = true;
     }
 
     int slash = base.indexOf('/');
@@ -67,14 +75,18 @@ void configureHttpUpload(HTTPClient& http) {
     http.setReuse(false);
 }
 
-bool beginDownloadRequest(HTTPClient& http, WiFiClient& client, const char* path) {
+bool beginDownloadRequest(HTTPClient& http, WiFiClient& plain, WiFiClientSecure& secure, const char* path) {
     ApiEndpoint ep = parseEndpoint(path);
     configureHttpDownload(http);
     Serial.printf("api: %s:%u%s\n", ep.host.c_str(), ep.port, ep.uri.c_str());
-    return http.begin(client, ep.host, ep.port, ep.uri);
+    if (apiUsesTls()) {
+        secure.setInsecure();
+        return http.begin(secure, ep.host, ep.port, ep.uri);
+    }
+    return http.begin(plain, ep.host, ep.port, ep.uri);
 }
 
-bool beginRequest(HTTPClient& http, WiFiClient& client, const char* path, bool forUpload) {
+bool beginRequest(HTTPClient& http, WiFiClient& plain, WiFiClientSecure& secure, const char* path, bool forUpload) {
     ApiEndpoint ep = parseEndpoint(path);
     if (forUpload) {
         configureHttpUpload(http);
@@ -82,11 +94,15 @@ bool beginRequest(HTTPClient& http, WiFiClient& client, const char* path, bool f
         configureHttp(http);
     }
     Serial.printf("api: %s:%u%s\n", ep.host.c_str(), ep.port, ep.uri.c_str());
-    return http.begin(client, ep.host, ep.port, ep.uri);
+    if (apiUsesTls()) {
+        secure.setInsecure();
+        return http.begin(secure, ep.host, ep.port, ep.uri);
+    }
+    return http.begin(plain, ep.host, ep.port, ep.uri);
 }
 
-bool beginRequest(HTTPClient& http, WiFiClient& client, const char* path) {
-    return beginRequest(http, client, path, false);
+bool beginRequest(HTTPClient& http, WiFiClient& plain, WiFiClientSecure& secure, const char* path) {
+    return beginRequest(http, plain, secure, path, false);
 }
 
 void logHttpResult(const char* op, int code) {
@@ -353,9 +369,10 @@ void ApiClient::setAuth(HTTPClient& http) {
 }
 
 bool ApiClient::heartbeat() {
-    WiFiClient client;
+    WiFiClient plain;
+    WiFiClientSecure secure;
     HTTPClient http;
-    if (!beginRequest(http, client, "/api/v1/device/heartbeat")) {
+    if (!beginRequest(http, plain, secure, "/api/v1/device/heartbeat")) {
         Serial.println("heartbeat: begin failed");
         return false;
     }
@@ -367,9 +384,10 @@ bool ApiClient::heartbeat() {
 }
 
 bool ApiClient::pollNext(NextMessage& out) {
-    WiFiClient client;
+    WiFiClient plain;
+    WiFiClientSecure secure;
     HTTPClient http;
-    if (!beginRequest(http, client, "/api/v1/device/messages/next")) {
+    if (!beginRequest(http, plain, secure, "/api/v1/device/messages/next")) {
         return false;
     }
     setAuth(http);
@@ -397,9 +415,10 @@ bool ApiClient::pollNext(NextMessage& out) {
 }
 
 bool ApiClient::uploadAudio(const uint8_t* data, size_t len) {
-    WiFiClient client;
+    WiFiClient plain;
+    WiFiClientSecure secure;
     HTTPClient http;
-    if (!beginRequest(http, client, "/api/v1/device/messages", true)) {
+    if (!beginRequest(http, plain, secure, "/api/v1/device/messages", true)) {
         Serial.println("upload: begin failed");
         return false;
     }
@@ -437,9 +456,10 @@ bool ApiClient::uploadAudioFile(const char* path) {
         return false;
     }
 
-    WiFiClient client;
+    WiFiClient plain;
+    WiFiClientSecure secure;
     HTTPClient http;
-    if (!beginRequest(http, client, "/api/v1/device/messages", true)) {
+    if (!beginRequest(http, plain, secure, "/api/v1/device/messages", true)) {
         Serial.println("upload: begin failed");
         file.close();
         return false;
@@ -471,9 +491,10 @@ bool ApiClient::uploadRecording(const uint8_t* wavHeader, size_t pcmBytes, int c
         return false;
     }
 
-    WiFiClient client;
+    WiFiClient plain;
+    WiFiClientSecure secure;
     HTTPClient http;
-    if (!beginRequest(http, client, "/api/v1/device/messages", true)) {
+    if (!beginRequest(http, plain, secure, "/api/v1/device/messages", true)) {
         Serial.println("upload: begin failed");
         return false;
     }
@@ -511,10 +532,11 @@ bool ApiClient::uploadRecording(const uint8_t* wavHeader, size_t pcmBytes, int c
 }
 
 bool ApiClient::downloadAudioToFile(const char* messageId, const char* path) {
-    WiFiClient client;
+    WiFiClient plain;
+    WiFiClientSecure secure;
     HTTPClient http;
     String apiPath = String("/api/v1/device/messages/") + messageId + "/audio";
-    if (!beginDownloadRequest(http, client, apiPath.c_str())) {
+    if (!beginDownloadRequest(http, plain, secure, apiPath.c_str())) {
         return false;
     }
     setAuth(http);
@@ -579,10 +601,11 @@ bool ApiClient::downloadAudioToFile(const char* messageId, const char* path) {
 }
 
 bool ApiClient::markPlayed(const char* messageId) {
-    WiFiClient client;
+    WiFiClient plain;
+    WiFiClientSecure secure;
     HTTPClient http;
     String path = String("/api/v1/device/messages/") + messageId + "/played";
-    if (!beginRequest(http, client, path.c_str())) {
+    if (!beginRequest(http, plain, secure, path.c_str())) {
         return false;
     }
     setAuth(http);

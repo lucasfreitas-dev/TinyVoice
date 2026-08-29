@@ -95,4 +95,4 @@ Deploy with HTTPS on your own domain — see [docs/deployment.md](docs/deploymen
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
