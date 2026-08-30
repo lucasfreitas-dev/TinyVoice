@@ -37,9 +37,7 @@ struct UploadJob {
 
 static UploadJob s_uploadJob;
 static volatile bool s_uploadRequested = false;
-static volatile bool s_uploadFinished = false;
-static volatile bool s_uploadSuccess = false;
-static TaskHandle_t s_uploadTask = nullptr;
+static unsigned long s_uploadRetryAfter = 0;
 
 static unsigned long s_apiBackoffUntil = 0;
 static int s_apiFailStreak = 0;
@@ -54,7 +52,7 @@ static void noteApiFailure() {
     if (s_apiFailStreak >= 3) {
         s_apiBackoffUntil = millis() + 60000;
         s_apiFailStreak = 0;
-        Serial.println("api: offline, backing off 60s (start Docker on the host)");
+        Serial.println("api: unreachable, backing off 60s");
     }
 }
 
@@ -62,56 +60,106 @@ static bool apiCallsAllowed() {
     return millis() >= s_apiBackoffUntil;
 }
 
-static void uploadTaskEntry(void* arg) {
-    (void)arg;
-    UploadJob job = s_uploadJob;
-    s_uploadSuccess = apiClient.uploadRecording(job.wavHeader, job.pcmBytes, job.chunkCount);
-    s_uploadFinished = true;
-    s_uploadTask = nullptr;
-    vTaskDelete(nullptr);
-}
-
 static void requestUpload(const uint8_t* wavHeader, size_t pcmBytes, int chunkCount) {
     memcpy(s_uploadJob.wavHeader, wavHeader, 44);
     s_uploadJob.pcmBytes = pcmBytes;
     s_uploadJob.chunkCount = chunkCount;
-    s_uploadFinished = false;
-    s_uploadSuccess = false;
     s_uploadRequested = true;
 }
 
-void handleUploading() {
-    if (s_uploadRequested && s_uploadTask == nullptr) {
-        s_uploadRequested = false;
-        Serial.printf("upload: starting (%u pcm bytes, %d chunks)\n",
-                      (unsigned)s_uploadJob.pcmBytes, s_uploadJob.chunkCount);
-        Serial.flush();
-        xTaskCreatePinnedToCore(
-            uploadTaskEntry,
-            "upload",
-            12288,
-            nullptr,
-            5,
-            &s_uploadTask,
-            0
-        );
+static const char* UPLOAD_WAV_PATH = "/rec/upload.wav";
+
+enum class NetJob : uint8_t { NONE, POLL, DOWNLOAD, MARK_PLAYED };
+
+// A single long-lived worker owns every background TLS call. Creating a task per poll or
+// per download meant a tight heap could refuse the allocation, which is what left inbound
+// messages unplayable ("download: task create failed").
+static TaskHandle_t s_netTask = nullptr;
+static volatile NetJob s_netJob = NetJob::NONE;
+static volatile bool s_netBusy = false;
+
+static void startNetWorker();
+
+static bool requestNetJob(NetJob job) {
+    if (s_netTask == nullptr || s_netBusy) {
+        return false;
+    }
+    s_netBusy = true;
+    s_netJob = job;
+    return true;
+}
+
+static void waitForNetIdle(unsigned long timeoutMs) {
+    unsigned long start = millis();
+    while (s_netBusy && millis() - start < timeoutMs) {
+        led.loop();
+        delay(25);
+    }
+}
+
+static void uploadProgressTick() {
+    led.loop();
+}
+
+static void runUploadJob() {
+    waitForNetIdle(30000);
+
+    Serial.printf("upload: starting (%u pcm bytes, %d chunks)\n",
+                  (unsigned)s_uploadJob.pcmBytes, s_uploadJob.chunkCount);
+    Serial.flush();
+
+    apiClient.releaseConnections();
+    audioRecorder.releaseMemoryForNetwork();
+    delay(200);
+    Serial.printf("upload: after memory release free=%u max=%u\n",
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+
+    bool ok = false;
+    if (audioRecorder.canAssembleUploadWav(s_uploadJob.pcmBytes) &&
+        audioRecorder.assembleUploadWav(
+            UPLOAD_WAV_PATH,
+            s_uploadJob.wavHeader,
+            s_uploadJob.pcmBytes,
+            s_uploadJob.chunkCount)) {
+        Serial.println("upload: using assembled file");
+        ok = apiClient.uploadRecordingFile(UPLOAD_WAV_PATH);
+        if (LittleFS.exists(UPLOAD_WAV_PATH)) {
+            LittleFS.remove(UPLOAD_WAV_PATH);
+        }
+    } else {
+        Serial.println("upload: streaming from chunks");
+        ok = apiClient.uploadRecordingStream(
+            s_uploadJob.wavHeader,
+            s_uploadJob.pcmBytes,
+            s_uploadJob.chunkCount);
     }
 
-    if (s_uploadFinished && s_uploadTask == nullptr) {
-        s_uploadFinished = false;
-        Serial.printf("upload: %s (%u bytes)\n",
-                      s_uploadSuccess ? "ok" : "failed",
-                      (unsigned)(44 + s_uploadJob.pcmBytes));
-        Serial.flush();
-        if (s_uploadSuccess) {
-            stateMachine.onUploadSuccess();
-            audioRecorder.cleanupRecording();
-        } else {
-            stateMachine.onUploadFailed();
-        }
-        led.update(stateMachine.current(), stateMachine.hasPendingMessage());
-        Serial.printf("state: %s\n", stateToString(stateMachine.current()));
+    Serial.printf("upload: %s (%u bytes)\n",
+                  ok ? "ok" : "failed",
+                  (unsigned)(44 + s_uploadJob.pcmBytes));
+    Serial.flush();
+
+    if (ok) {
+        s_uploadRetryAfter = 0;
+        stateMachine.onUploadSuccess();
+        audioRecorder.cleanupRecording();
+    } else {
+        s_uploadRetryAfter = millis() + 30000;
+        apiClient.releaseConnections();
+        delay(500);
+        stateMachine.onUploadFailed();
     }
+    led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+    Serial.printf("state: %s\n", stateToString(stateMachine.current()));
+}
+
+void handleUploading() {
+    if (!s_uploadRequested) {
+        return;
+    }
+    s_uploadRequested = false;
+    led.update(DeviceState::UPLOADING, stateMachine.hasPendingMessage());
+    runUploadJob();
 }
 
 bool mountLittleFS() {
@@ -242,11 +290,6 @@ void setup() {
     wifiManager.begin();
     if (wifiManager.connect()) {
         stateMachine.onWiFiConnected();
-        if (apiClient.heartbeat()) {
-            noteApiSuccess();
-        } else {
-            noteApiFailure();
-        }
     } else {
         stateMachine.onWiFiFailed();
     }
@@ -254,9 +297,10 @@ void setup() {
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("wifi: connected, ip=%s\n", WiFi.localIP().toString().c_str());
         Serial.printf("api target: %s\n", API_BASE_URL);
-        if (!apiCallsAllowed()) {
-            Serial.println("api: waiting for backoff to expire or Docker to start");
-        }
+        setApiProgressHook(uploadProgressTick);
+        startNetWorker();
+        lastPollMs = millis() - POLL_INTERVAL_MS;
+        lastHeartbeatMs = millis();
     }
 
     led.update(stateMachine.current(), stateMachine.hasPendingMessage());
@@ -264,8 +308,11 @@ void setup() {
 }
 
 bool uploadPendingRecording() {
-    if (s_uploadTask != nullptr || s_uploadRequested || s_uploadFinished) {
-        return true;
+    if (millis() < s_uploadRetryAfter) {
+        return false;
+    }
+    if (s_uploadRequested) {
+        return false;
     }
     if (!audioRecorder.hasPendingRecording()) {
         return false;
@@ -283,9 +330,11 @@ bool uploadPendingRecording() {
 void handleRecording() {
     audioRecorder.loop();
 
-    if (button.wasRelease() || audioRecorder.maxDurationReached() || audioRecorder.diskFull()) {
-        if (audioRecorder.diskFull()) {
-            Serial.println("recording stopped: flash full");
+    if (button.wasRelease() || audioRecorder.maxDurationReached() || audioRecorder.flashLimitReached()) {
+        if (audioRecorder.flashLimitReached()) {
+            Serial.println("recording stopped: flash limit (upload safe)");
+        } else if (audioRecorder.maxDurationReached()) {
+            Serial.println("recording stopped: max safe length");
         }
         size_t fileLen = 0;
         size_t pcmBytes = audioRecorder.stop(&fileLen);
@@ -319,30 +368,131 @@ void handleRecording() {
 
 static const char* INBOUND_PLAY_PATH = "/play.wav";
 
-void handleDownloadAndPlay() {
-    if (!apiClient.downloadAudioToFile(pendingMessageId, INBOUND_PLAY_PATH)) {
+static volatile bool s_downloadTaskDone = false;
+static volatile bool s_inboundReady = false;
+static char s_downloadMessageId[40] = {0};
+
+static volatile bool s_pollTaskDone = false;
+static bool s_pollOk = false;
+static NextMessage s_pollMsg = {};
+
+static void runDownloadJob() {
+    Serial.println("download: started");
+
+    apiClient.releaseConnections();
+    audioRecorder.releaseMemoryForNetwork();
+    delay(200);
+    Serial.printf("download: after memory release free=%u max=%u\n",
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+
+    bool ok = apiClient.downloadAudioToFile(s_downloadMessageId, INBOUND_PLAY_PATH);
+
+    if (ok) {
+        stateMachine.onDownloadComplete();
+        s_inboundReady = true;
+        Serial.println("download: file ready");
+    } else {
         Serial.println("download: failed");
         stateMachine.onDownloadFailed();
-        led.update(stateMachine.current(), stateMachine.hasPendingMessage());
-        return;
     }
 
-    stateMachine.onDownloadComplete();
+    s_downloadTaskDone = true;
+}
+
+static void netTaskEntry(void* arg) {
+    (void)arg;
+    for (;;) {
+        NetJob job = s_netJob;
+        if (job == NetJob::NONE) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        if (job == NetJob::POLL) {
+            s_pollOk = apiClient.pollNext(s_pollMsg);
+            s_pollTaskDone = true;
+        } else if (job == NetJob::MARK_PLAYED) {
+            apiClient.markPlayed(s_downloadMessageId);
+            s_downloadMessageId[0] = '\0';
+        } else {
+            runDownloadJob();
+        }
+
+        s_netJob = NetJob::NONE;
+        s_netBusy = false;
+    }
+}
+
+static void startNetWorker() {
+    static unsigned long retryAfter = 0;
+    if (s_netTask != nullptr || millis() < retryAfter) {
+        return;
+    }
+    retryAfter = millis() + 5000;
+    BaseType_t created = xTaskCreatePinnedToCore(
+        netTaskEntry,
+        "net",
+        8192,
+        nullptr,
+        2,
+        &s_netTask,
+        0
+    );
+    if (created != pdPASS) {
+        Serial.println("net: worker create failed");
+        s_netTask = nullptr;
+    }
+}
+
+static void handleInboundPlayback() {
+    if (!s_inboundReady) {
+        return;
+    }
+    s_inboundReady = false;
+
     led.update(stateMachine.current(), stateMachine.hasPendingMessage());
 
     if (!audioPlayer.playFile(INBOUND_PLAY_PATH)) {
         Serial.println("audio: playback failed");
     }
     LittleFS.remove(INBOUND_PLAY_PATH);
-
-    apiClient.markPlayed(pendingMessageId);
     pendingMessageId[0] = '\0';
     stateMachine.onPlaybackComplete();
     led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+    Serial.println("playback: complete");
+
+    // Acking runs on the worker: a blocking TLS call here would freeze the state machine.
+    if (!requestNetJob(NetJob::MARK_PLAYED)) {
+        Serial.println("played: worker busy, will retry on next poll");
+    }
+}
+
+static void startDownloadAndPlay() {
+    if (pendingMessageId[0] == '\0') {
+        Serial.println("download: no message id");
+        stateMachine.onDownloadFailed();
+        return;
+    }
+    strlcpy(s_downloadMessageId, pendingMessageId, sizeof(s_downloadMessageId));
+
+    // A poll may be in flight; it finishes in a few seconds and both share the worker.
+    waitForNetIdle(30000);
+    s_downloadTaskDone = false;
+    if (!requestNetJob(NetJob::DOWNLOAD)) {
+        Serial.println("download: worker busy");
+        stateMachine.onDownloadFailed();
+    }
+}
+
+void handleDownloadAndPlay() {
+    startDownloadAndPlay();
 }
 
 void loop() {
     wifiManager.loop();
+    if (wifiManager.isConnected()) {
+        startNetWorker();
+    }
     button.loop();
     led.setWiFiConnected(wifiManager.isConnected());
     led.loop();
@@ -373,14 +523,26 @@ void loop() {
         led.setPressedHint(false);
     }
 
-    // Button: hold to record (works whenever Wi-Fi is up and not busy uploading/playing)
+    // Button: short press to play pending message (quick tap < HOLD_THRESHOLD_MS)
+    if (button.wasShortPress() && stateMachine.hasPendingMessage()) {
+        Serial.println("button: play requested");
+        stateMachine.onButtonShortPress();
+        if (stateMachine.current() == DeviceState::DOWNLOADING) {
+            handleDownloadAndPlay();
+            led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+        }
+    }
+
+    // Button: hold to record (only when no pending message to play)
     if (button.wasJustHeld() &&
         wifiManager.isConnected() &&
+        !stateMachine.hasPendingMessage() &&
         (state == DeviceState::IDLE ||
          state == DeviceState::CHECKING_MESSAGES ||
          state == DeviceState::ERROR)) {
         stateMachine.onButtonHoldStart();
         if (stateMachine.current() == DeviceState::RECORDING) {
+            waitForNetIdle(5000);
             if (!audioRecorder.start()) {
                 Serial.println("recording start failed");
                 stateMachine.onRecordingCancelled();
@@ -388,14 +550,6 @@ void loop() {
                 Serial.println("recording started");
             }
             led.update(stateMachine.current(), stateMachine.hasPendingMessage());
-        }
-    }
-
-    // Button: short press to play
-    if (button.wasShortPress() && stateMachine.hasPendingMessage()) {
-        stateMachine.onButtonShortPress();
-        if (stateMachine.current() == DeviceState::DOWNLOADING) {
-            handleDownloadAndPlay();
         }
     }
 
@@ -408,9 +562,40 @@ void loop() {
         handleUploading();
     }
 
-    // Heartbeat every 60s
+    if (s_downloadTaskDone) {
+        s_downloadTaskDone = false;
+        led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+    }
+
+    handleInboundPlayback();
+
+    if (s_pollTaskDone) {
+        s_pollTaskDone = false;
+        if (s_pollOk) {
+            noteApiSuccess();
+            if (s_pollMsg.available) {
+                strlcpy(pendingMessageId, s_pollMsg.id, sizeof(pendingMessageId));
+                Serial.printf("poll: message available id=%s\n", pendingMessageId);
+            } else {
+                Serial.printf("poll: no message (free=%u max=%u)\n",
+                              ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+            }
+            stateMachine.onPollComplete(s_pollMsg.available);
+        } else {
+            noteApiFailure();
+            stateMachine.onPollComplete(stateMachine.hasPendingMessage());
+        }
+        led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+    }
+
+    // Heartbeat every 60s (skip while the worker holds a TLS session)
     if (apiCallsAllowed() &&
         wifiManager.isConnected() &&
+        stateMachine.current() != DeviceState::UPLOADING &&
+        stateMachine.current() != DeviceState::DOWNLOADING &&
+        stateMachine.current() != DeviceState::PLAYING &&
+        stateMachine.current() != DeviceState::RECORDING &&
+        !s_netBusy &&
         millis() - lastHeartbeatMs > 60000) {
         lastHeartbeatMs = millis();
         if (apiClient.heartbeat()) {
@@ -420,35 +605,27 @@ void loop() {
         }
     }
 
-    // Poll for messages (skip while button is in use so HTTP does not block input)
+    // Poll for messages in background so button stays responsive
     if (apiCallsAllowed() &&
         !buttonActive &&
         wifiManager.isConnected() &&
+        stateMachine.current() == DeviceState::IDLE &&
+        !s_uploadRequested &&
+        !s_netBusy &&
+        !s_inboundReady &&
         millis() - lastPollMs > POLL_INTERVAL_MS &&
-        stateMachine.current() == DeviceState::IDLE) {
+        millis() >= s_uploadRetryAfter) {
         lastPollMs = millis();
-        stateMachine.onPollStart();
-        NextMessage msg;
-        if (apiClient.pollNext(msg)) {
-            noteApiSuccess();
-            if (msg.available) {
-                strlcpy(pendingMessageId, msg.id, sizeof(pendingMessageId));
-            }
-            stateMachine.onPollComplete(msg.available);
-        } else {
-            noteApiFailure();
-            stateMachine.onPollComplete(stateMachine.hasPendingMessage());
-        }
-        led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+        s_pollTaskDone = false;
+        requestNetJob(NetJob::POLL);
     }
 
     // Retry pending chunk recording or legacy queue uploads when idle
     if (!buttonActive &&
         stateMachine.current() == DeviceState::IDLE &&
         wifiManager.isConnected() &&
-        s_uploadTask == nullptr &&
         !s_uploadRequested &&
-        !s_uploadFinished) {
+        !s_netBusy) {
         if (!uploadPendingRecording()) {
             processQueue();
         }

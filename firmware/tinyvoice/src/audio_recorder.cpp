@@ -15,21 +15,51 @@ static const i2s_port_t I2S_MIC = I2S_NUM_0;
 static const char* REC_DIR = "/rec";
 static const int INMP441_SHIFT = 14;
 static const size_t I2S_READ_SAMPLES = 256;
-static const size_t STAGING_BYTES = 16384;
+// Capture fills one chunk slot directly and hands it to the flush worker, so there is no
+// separate staging buffer and no memcpy per chunk. Do not shrink this: each chunk is its
+// own LittleFS file, and at 8 KB the create-per-chunk cost drops write throughput below
+// the 32 KB/s capture rate.
+static const size_t CHUNK_BYTES = 16384;
 static const size_t FS_WRITE_MARGIN = 8192;
-static const size_t FS_RESERVE_BYTES = 65536;
-static const size_t RING_SAMPLE_COUNT = 24576;
+// Keep flash headroom for LittleFS metadata and in-place chunk upload (no WAV copy).
+static const size_t FS_UPLOAD_SAFE_BYTES = 24576;
+// One second of capture headroom: a LittleFS chunk write must never outlast the ring.
+static const size_t RING_SAMPLE_COUNT = 16384;
+// One slot is the live capture target, the other absorbs the write still in flight.
 static const size_t FLUSH_SLOTS = 2;
 static int16_t s_ringBuffer[RING_SAMPLE_COUNT];
+static AudioRecorder* s_recorderInstance = nullptr;
+// Loudest sample of the current take, so a dead or mis-wired mic is visible in the log.
+static volatile uint32_t s_peakAmplitude = 0;
+
+static size_t computeMaxPcmBytes() {
+    size_t freeBytes = storageFreeBytes();
+    if (freeBytes <= FS_UPLOAD_SAFE_BYTES + FS_WRITE_MARGIN) {
+        return 0;
+    }
+
+    size_t usable = freeBytes - FS_UPLOAD_SAFE_BYTES - FS_WRITE_MARGIN;
+    usable = (usable / CHUNK_BYTES) * CHUNK_BYTES;
+
+    size_t cap = (size_t)MAX_RECORDING_SECONDS * BYTES_PER_SECOND;
+    if (usable > cap) {
+        usable = cap;
+    }
+    return usable;
+}
 
 struct FlushSlot {
-    uint8_t data[STAGING_BYTES];
+    uint8_t data[CHUNK_BYTES];
     size_t len;
     int chunkIndex;
 };
 
-static FlushSlot* s_flushSlots = nullptr;
+// Statically reserved: a heap block this large fragmented the heap for the rest of the
+// uptime, leaving mbedTLS without a contiguous span even with plenty of free bytes.
+static FlushSlot s_flushSlots[FLUSH_SLOTS];
 static volatile bool s_slotFree[FLUSH_SLOTS] = {true, true};
+// Slot currently being filled by capture; owned by the recorder, never by the worker.
+static int s_activeSlot = -1;
 static QueueHandle_t s_flushQueue = nullptr;
 static TaskHandle_t s_flushTask = nullptr;
 
@@ -89,6 +119,9 @@ static void flushWorkerEntry(void* arg) {
         FlushSlot& slot = s_flushSlots[slotIdx];
         if (!writeChunkToDisk(slot.data, slot.len, slot.chunkIndex)) {
             Serial.println("audio: background chunk write failed");
+            if (s_recorderInstance) {
+                s_recorderInstance->markFlashLimit();
+            }
         }
         s_slotFree[slotIdx] = true;
     }
@@ -104,22 +137,12 @@ static bool acquireFlushSlot(int& outSlot, unsigned long timeoutMs) {
                 return true;
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
     return false;
 }
 
 static void startFlushWorker() {
-    if (s_flushSlots == nullptr) {
-        s_flushSlots = (FlushSlot*)heap_caps_malloc(sizeof(FlushSlot) * FLUSH_SLOTS, MALLOC_CAP_8BIT);
-        if (!s_flushSlots) {
-            Serial.println("audio: flush buffer alloc failed");
-            return;
-        }
-        for (size_t i = 0; i < FLUSH_SLOTS; i++) {
-            s_slotFree[i] = true;
-        }
-    }
     if (s_flushQueue == nullptr) {
         s_flushQueue = xQueueCreate(4, sizeof(uint8_t));
     }
@@ -178,6 +201,105 @@ void AudioRecorder::cleanupRecording() {
     _writePos = 0;
 }
 
+void AudioRecorder::releaseMemoryForNetwork() {
+    waitForPendingFlushes();
+    if (_recording) {
+        return;
+    }
+    _writePos = 0;
+}
+
+bool AudioRecorder::canAssembleUploadWav(size_t pcmBytes) const {
+    size_t needed = pcmBytes + 44 + 4096;
+    return storageFreeBytes() >= needed;
+}
+
+bool AudioRecorder::assembleUploadWav(const char* destPath, const uint8_t* wavHeader,
+                                      size_t pcmBytes, int chunkCount) {
+    waitForPendingFlushes();
+
+    if (!canAssembleUploadWav(pcmBytes)) {
+        Serial.printf("upload: skip assemble (need %u, free %u)\n",
+                      (unsigned)(pcmBytes + 44 + 4096),
+                      (unsigned)storageFreeBytes());
+        return false;
+    }
+
+    if (!ensureRecordDir()) {
+        return false;
+    }
+
+    if (LittleFS.exists(destPath)) {
+        LittleFS.remove(destPath);
+    }
+
+    if (!storageLock()) {
+        Serial.println("upload: assemble lock timeout");
+        return false;
+    }
+
+    File out = LittleFS.open(destPath, FILE_WRITE);
+    if (!out) {
+        storageUnlock();
+        Serial.println("upload: assemble open failed");
+        return false;
+    }
+
+    if (out.write(wavHeader, 44) != 44) {
+        out.close();
+        storageUnlock();
+        LittleFS.remove(destPath);
+        Serial.println("upload: assemble header write failed");
+        return false;
+    }
+
+    size_t copied = 0;
+    uint8_t buf[1024];
+    for (int i = 0; i < chunkCount; i++) {
+        char path[24];
+        snprintf(path, sizeof(path), "/rec/c%04d.pcm", i);
+        File in = LittleFS.open(path, FILE_READ);
+        if (!in) {
+            Serial.printf("upload: missing chunk %s\n", path);
+            out.close();
+            storageUnlock();
+            LittleFS.remove(destPath);
+            return false;
+        }
+
+        while (in.available()) {
+            size_t n = in.read(buf, sizeof(buf));
+            if (n == 0) {
+                break;
+            }
+            if (out.write(buf, n) != n) {
+                in.close();
+                out.close();
+                storageUnlock();
+                LittleFS.remove(destPath);
+                Serial.println("upload: assemble pcm write failed");
+                return false;
+            }
+            copied += n;
+        }
+        in.close();
+        yield();
+    }
+
+    out.close();
+    storageUnlock();
+
+    if (copied != pcmBytes) {
+        Serial.printf("upload: assemble size mismatch (%u != %u)\n",
+                      (unsigned)copied, (unsigned)pcmBytes);
+        LittleFS.remove(destPath);
+        return false;
+    }
+
+    Serial.printf("upload: assembled %u bytes\n", (unsigned)(44 + copied));
+    return true;
+}
+
 int AudioRecorder::chunkCount() const {
     return _chunkCount;
 }
@@ -211,12 +333,19 @@ void AudioRecorder::captureTaskLoop() {
         }
 
         size_t rawCount = bytesRead / sizeof(int32_t);
+        uint32_t peak = s_peakAmplitude;
         for (size_t i = 0; i < rawCount; i++) {
             int32_t s = raw[i] >> INMP441_SHIFT;
             if (s > 32767) s = 32767;
             if (s < -32768) s = -32768;
             samples[i] = (int16_t)s;
+
+            uint32_t magnitude = (uint32_t)(s < 0 ? -s : s);
+            if (magnitude > peak) {
+                peak = magnitude;
+            }
         }
+        s_peakAmplitude = peak;
         pushRing(samples, rawCount);
     }
 }
@@ -258,16 +387,26 @@ void AudioRecorder::initRing() {
     _ringCapacity = RING_SAMPLE_COUNT;
 }
 
+// Takes ownership of a chunk slot and makes it the live capture target.
 bool AudioRecorder::allocateStaging() {
-    if (_staging) {
+    if (s_activeSlot >= 0) {
+        _staging = s_flushSlots[s_activeSlot].data;
+        _stagingSize = CHUNK_BYTES;
         return true;
     }
-    _stagingSize = STAGING_BYTES;
-    _staging = (uint8_t*)heap_caps_malloc(_stagingSize, MALLOC_CAP_8BIT);
-    if (!_staging) {
-        Serial.println("audio: staging alloc failed");
+
+    int slot = 0;
+    if (!acquireFlushSlot(slot, 1000)) {
+        Serial.println("audio: no free chunk slot");
+        _staging = nullptr;
+        _stagingSize = 0;
+        return false;
     }
-    return _staging != nullptr;
+
+    s_activeSlot = slot;
+    _staging = s_flushSlots[slot].data;
+    _stagingSize = CHUNK_BYTES;
+    return true;
 }
 
 bool AudioRecorder::begin() {
@@ -275,7 +414,9 @@ bool AudioRecorder::begin() {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
         .sample_rate = SAMPLE_RATE,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        // INMP441 with L/R tied to GND drives the WS-low slot, which the ESP32 legacy I2S
+        // RX path exposes as ONLY_RIGHT. ONLY_LEFT samples the idle slot, i.e. silence.
+        .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count = 16,
@@ -331,11 +472,25 @@ bool AudioRecorder::begin() {
 
     startFlushWorker();
 
-    Serial.printf("audio: recorder ready (max %u s, staging %u bytes, ring %u samples)\n",
+    Serial.printf("audio: recorder ready (max %u s, %u chunk slots of %u bytes, ring %u samples)\n",
                   (unsigned)MAX_RECORDING_SECONDS,
-                  (unsigned)_stagingSize,
+                  (unsigned)FLUSH_SLOTS,
+                  (unsigned)CHUNK_BYTES,
                   (unsigned)_ringCapacity);
     return true;
+}
+
+bool AudioRecorder::hasSpaceForChunk(size_t bytes) const {
+    return storageFreeBytes() >= bytes + FS_WRITE_MARGIN;
+}
+
+void AudioRecorder::markFlashLimit() {
+    if (_diskFull) {
+        return;
+    }
+    _diskFull = true;
+    _recording = false;
+    Serial.println("audio: flash limit reached (safe for upload)");
 }
 
 bool AudioRecorder::writeChunkSync() {
@@ -343,9 +498,13 @@ bool AudioRecorder::writeChunkSync() {
         return true;
     }
 
+    if (!hasSpaceForChunk(_writePos)) {
+        markFlashLimit();
+        return false;
+    }
+
     if (!writeChunkToDisk(_staging, _writePos, _nextChunkIndex)) {
-        _diskFull = true;
-        _recording = false;
+        markFlashLimit();
         return false;
     }
 
@@ -360,29 +519,40 @@ bool AudioRecorder::queueChunkFlush() {
     if (_writePos == 0 || _diskFull) {
         return true;
     }
-    if (!s_flushSlots) {
+
+    if (!hasSpaceForChunk(_writePos)) {
+        markFlashLimit();
+        return false;
+    }
+
+    if (s_activeSlot < 0 || !s_flushQueue) {
         return writeChunkSync();
     }
 
-    int slot = 0;
-    if (!acquireFlushSlot(slot, 20)) {
+    // Capture can only be handed off if there is another slot to continue into; otherwise
+    // write this one here, which keeps the ring draining instead of stalling on the worker.
+    int nextSlot = 0;
+    if (!acquireFlushSlot(nextSlot, 500)) {
         return writeChunkSync();
     }
 
-    memcpy(s_flushSlots[slot].data, _staging, _writePos);
-    s_flushSlots[slot].len = _writePos;
-    s_flushSlots[slot].chunkIndex = _nextChunkIndex;
+    int filled = s_activeSlot;
+    s_flushSlots[filled].len = _writePos;
+    s_flushSlots[filled].chunkIndex = _nextChunkIndex;
+
+    uint8_t slotIdx = (uint8_t)filled;
+    if (xQueueSend(s_flushQueue, &slotIdx, 0) != pdTRUE) {
+        s_slotFree[nextSlot] = true;
+        return writeChunkSync();
+    }
+
+    s_activeSlot = nextSlot;
+    _staging = s_flushSlots[nextSlot].data;
 
     _pcmTotal += _writePos;
     _writePos = 0;
     _nextChunkIndex++;
     _chunkCount++;
-
-    uint8_t slotIdx = (uint8_t)slot;
-    if (xQueueSend(s_flushQueue, &slotIdx, 0) != pdTRUE) {
-        s_slotFree[slot] = true;
-        return writeChunkSync();
-    }
     return true;
 }
 
@@ -393,7 +563,8 @@ void AudioRecorder::waitForPendingFlushes() {
             pending = true;
         }
         for (size_t j = 0; j < FLUSH_SLOTS; j++) {
-            if (!s_slotFree[j]) {
+            // The live capture slot is permanently held by the recorder, not the worker.
+            if ((int)j != s_activeSlot && !s_slotFree[j]) {
                 pending = true;
             }
         }
@@ -410,25 +581,25 @@ bool AudioRecorder::start() {
         Serial.println("audio: already recording");
         return false;
     }
+    startFlushWorker();
     if (!allocateStaging()) {
         return false;
     }
 
+    s_recorderInstance = this;
+
     storagePruneForRecording();
     cleanupRecording();
 
-    size_t freeBytes = storageFreeBytes();
-    if (freeBytes < BYTES_PER_SECOND + FS_RESERVE_BYTES) {
-        Serial.printf("audio: not enough flash (free %u)\n", (unsigned)freeBytes);
+    _maxPcmBytes = computeMaxPcmBytes();
+    if (_maxPcmBytes < BYTES_PER_SECOND / 2) {
+        Serial.printf("audio: not enough flash (free %u)\n", (unsigned)storageFreeBytes());
         return false;
     }
 
-    _maxPcmBytes = BYTES_PER_SECOND * MAX_RECORDING_SECONDS;
-    size_t maxByFlash = freeBytes - FS_RESERVE_BYTES;
-    if (maxByFlash < _maxPcmBytes) {
-        _maxPcmBytes = (maxByFlash / BYTES_PER_SECOND) * BYTES_PER_SECOND;
-        Serial.printf("audio: max recording capped to %u s by flash\n",
-                      (unsigned)(_maxPcmBytes / BYTES_PER_SECOND));
+    unsigned maxSec = (unsigned)(_maxPcmBytes / BYTES_PER_SECOND);
+    if (maxSec < (unsigned)MAX_RECORDING_SECONDS) {
+        Serial.printf("audio: max recording capped to %u s by flash (safe for upload)\n", maxSec);
     }
 
     portENTER_CRITICAL(&ringMux);
@@ -438,6 +609,7 @@ bool AudioRecorder::start() {
     _droppedSamples = 0;
     portEXIT_CRITICAL(&ringMux);
 
+    s_peakAmplitude = 0;
     i2s_zero_dma_buffer(I2S_MIC);
     _writePos = 0;
     _pcmTotal = 0;
@@ -470,6 +642,7 @@ void AudioRecorder::writeSamples(const int16_t* samples, size_t count) {
 
         size_t remainingPcm = _maxPcmBytes - (_pcmTotal + _writePos);
         if (remainingPcm == 0) {
+            _recording = false;
             return;
         }
 
@@ -550,8 +723,9 @@ size_t AudioRecorder::stop(size_t* outFileLen) {
     if (outFileLen) {
         *outFileLen = WAV_HEADER_SIZE + _pcmTotal;
     }
-    Serial.printf("recording stopped: %u pcm bytes (~%.1f s, %d chunks)",
-                  (unsigned)_pcmTotal, _pcmTotal / (float)BYTES_PER_SECOND, _chunkCount);
+    Serial.printf("recording stopped: %u pcm bytes (~%.1f s, %d chunks, peak %u)",
+                  (unsigned)_pcmTotal, _pcmTotal / (float)BYTES_PER_SECOND, _chunkCount,
+                  (unsigned)s_peakAmplitude);
     if (_droppedSamples > 0) {
         Serial.printf(", dropped %u samples", (unsigned)_droppedSamples);
     }
@@ -569,6 +743,14 @@ bool AudioRecorder::diskFull() const {
     return _diskFull;
 }
 
+bool AudioRecorder::flashLimitReached() const {
+    return _diskFull;
+}
+
+unsigned AudioRecorder::maxRecordingSeconds() const {
+    return (unsigned)(_maxPcmBytes / BYTES_PER_SECOND);
+}
+
 void AudioRecorder::loop() {
     if (_ringCount == 0) {
         return;
@@ -576,7 +758,14 @@ void AudioRecorder::loop() {
 
     int16_t chunk[I2S_READ_SAMPLES];
     size_t popped;
-    while ((popped = popRing(chunk, I2S_READ_SAMPLES)) > 0) {
+    // Bounded drain. Capture keeps filling the ring while we are in here, so draining
+    // until empty never terminates once flash writes fall behind real time — which hangs
+    // the main loop and with it the button. The ring absorbs whatever we leave behind.
+    const size_t budget = _ringCapacity / 2;
+    size_t drained = 0;
+
+    while (drained < budget && (popped = popRing(chunk, I2S_READ_SAMPLES)) > 0) {
         writeSamples(chunk, popped);
+        drained += popped;
     }
 }

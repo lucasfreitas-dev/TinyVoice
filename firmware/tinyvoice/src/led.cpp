@@ -92,6 +92,12 @@ void Led::applyOutputs() {
                 digitalWrite(LED_GREEN_PIN, HIGH);
             }
             break;
+        case DeviceState::DOWNLOADING:
+            if (_blinkOn) {
+                digitalWrite(LED_GREEN_PIN, HIGH);
+                digitalWrite(LED_BLUE_PIN, HIGH);
+            }
+            break;
         case DeviceState::PLAYING:
             digitalWrite(LED_GREEN_PIN, HIGH);
             break;
@@ -123,7 +129,8 @@ void Led::loop() {
     if (now - _lastBlinkMs > 400) {
         _lastBlinkMs = now;
         _blinkOn = !_blinkOn;
-        if (_currentState == DeviceState::UPLOADING) {
+        if (_currentState == DeviceState::UPLOADING ||
+            _currentState == DeviceState::DOWNLOADING) {
             applyOutputs();
         }
     }

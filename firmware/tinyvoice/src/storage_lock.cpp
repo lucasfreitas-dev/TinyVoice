@@ -76,6 +76,10 @@ void storageCleanupRecDir() {
         return;
     }
 
+    if (LittleFS.exists("/rec/upload.wav")) {
+        LittleFS.remove("/rec/upload.wav");
+    }
+
     File root = LittleFS.open("/rec");
     if (root && root.isDirectory()) {
         File entry = root.openNextFile();

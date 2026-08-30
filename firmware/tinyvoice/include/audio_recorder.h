@@ -13,13 +13,19 @@ public:
     bool isRecording() const;
     bool maxDurationReached() const;
     bool diskFull() const;
+    bool flashLimitReached() const;
+    unsigned maxRecordingSeconds() const;
     void loop();
     int chunkCount() const;
     size_t buildWavHeader(uint8_t* header, size_t dataSize) const;
     void cleanupRecording();
     bool hasPendingRecording() const;
+    void releaseMemoryForNetwork();
+    bool assembleUploadWav(const char* destPath, const uint8_t* wavHeader, size_t pcmBytes, int chunkCount);
+    bool canAssembleUploadWav(size_t pcmBytes) const;
     size_t recordedPcmBytes() const;
     void waitForPendingFlushes();
+    void markFlashLimit();
 
 private:
     volatile bool _recording;
@@ -46,6 +52,7 @@ private:
     bool ensureRecordDir();
     bool writeChunkSync();
     bool queueChunkFlush();
+    bool hasSpaceForChunk(size_t bytes) const;
     void writeSamples(const int16_t* samples, size_t count);
     void pushRing(const int16_t* samples, size_t count);
     size_t popRing(int16_t* samples, size_t maxCount);

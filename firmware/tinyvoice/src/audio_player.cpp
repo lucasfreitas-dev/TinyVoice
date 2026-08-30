@@ -136,6 +136,7 @@ bool AudioPlayer::play(const uint8_t* wavData, size_t len) {
         size_t bytesWritten = 0;
         i2s_write(I2S_SPK, pcm + written, chunk, &bytesWritten, portMAX_DELAY);
         written += bytesWritten;
+        yield();
     }
     _playing = false;
     Serial.printf("audio: played %u pcm bytes\n", (unsigned)pcmLen);
@@ -182,6 +183,7 @@ bool AudioPlayer::playFile(const char* path) {
         size_t bytesWritten = 0;
         i2s_write(I2S_SPK, buf, n, &bytesWritten, portMAX_DELAY);
         written += n;
+        yield();
     }
     f.close();
     _playing = false;

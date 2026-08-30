@@ -43,10 +43,11 @@ void Button::loop() {
 
             if (reading) {
                 _pressed = true;
+                _held = false;
                 _pressStartMs = now;
                 Serial.println("button: down");
             } else {
-                if (_pressed && now - _pressStartMs < (unsigned long)HOLD_THRESHOLD_MS) {
+                if (_pressed && !_held) {
                     _shortPress = true;
                     Serial.println("button: short press");
                 }
@@ -58,7 +59,8 @@ void Button::loop() {
         }
     }
 
-    if (_pressed && !_held && now - _pressStartMs >= (unsigned long)HOLD_THRESHOLD_MS) {
+    if (_pressed && !_held && _stableDown && reading &&
+        now - _pressStartMs >= (unsigned long)HOLD_THRESHOLD_MS) {
         _held = true;
         _justHeld = true;
         Serial.println("button: hold");
