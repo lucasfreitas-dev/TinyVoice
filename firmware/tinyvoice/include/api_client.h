@@ -20,8 +20,9 @@ public:
     bool pollNext(NextMessage& out);
     bool uploadAudio(const uint8_t* data, size_t len);
     bool uploadAudioFile(const char* path);
-    bool uploadRecordingFile(const char* path);
-    bool uploadRecordingStream(const uint8_t* wavHeader, size_t pcmBytes, int chunkCount);
+    // Sends the 44-byte WAV header followed by the raw PCM take, so nothing has to be
+    // concatenated into a second file first.
+    bool uploadRecordingPcm(const uint8_t* wavHeader, const char* pcmPath);
     bool downloadAudioToFile(const char* messageId, const char* path);
     bool markPlayed(const char* messageId);
     void releaseConnections();

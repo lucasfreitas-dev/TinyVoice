@@ -21,8 +21,7 @@ public:
     void cleanupRecording();
     bool hasPendingRecording() const;
     void releaseMemoryForNetwork();
-    bool assembleUploadWav(const char* destPath, const uint8_t* wavHeader, size_t pcmBytes, int chunkCount);
-    bool canAssembleUploadWav(size_t pcmBytes) const;
+    const char* takePath() const;
     size_t recordedPcmBytes() const;
     void waitForPendingFlushes();
     void markFlashLimit();

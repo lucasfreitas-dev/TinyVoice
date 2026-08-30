@@ -67,8 +67,6 @@ static void requestUpload(const uint8_t* wavHeader, size_t pcmBytes, int chunkCo
     s_uploadRequested = true;
 }
 
-static const char* UPLOAD_WAV_PATH = "/rec/upload.wav";
-
 enum class NetJob : uint8_t { NONE, POLL, DOWNLOAD, MARK_PLAYED };
 
 // A single long-lived worker owns every background TLS call. Creating a task per poll or
@@ -114,25 +112,7 @@ static void runUploadJob() {
     Serial.printf("upload: after memory release free=%u max=%u\n",
                   ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
-    bool ok = false;
-    if (audioRecorder.canAssembleUploadWav(s_uploadJob.pcmBytes) &&
-        audioRecorder.assembleUploadWav(
-            UPLOAD_WAV_PATH,
-            s_uploadJob.wavHeader,
-            s_uploadJob.pcmBytes,
-            s_uploadJob.chunkCount)) {
-        Serial.println("upload: using assembled file");
-        ok = apiClient.uploadRecordingFile(UPLOAD_WAV_PATH);
-        if (LittleFS.exists(UPLOAD_WAV_PATH)) {
-            LittleFS.remove(UPLOAD_WAV_PATH);
-        }
-    } else {
-        Serial.println("upload: streaming from chunks");
-        ok = apiClient.uploadRecordingStream(
-            s_uploadJob.wavHeader,
-            s_uploadJob.pcmBytes,
-            s_uploadJob.chunkCount);
-    }
+    bool ok = apiClient.uploadRecordingPcm(s_uploadJob.wavHeader, audioRecorder.takePath());
 
     Serial.printf("upload: %s (%u bytes)\n",
                   ok ? "ok" : "failed",

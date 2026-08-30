@@ -88,11 +88,17 @@ func main() {
 	}
 
 	srv := &http.Server{
-		Addr:         ":" + cfg.APIPort,
-		Handler:      router,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 120 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:    ":" + cfg.APIPort,
+		Handler: router,
+		// ReadTimeout covers reading the *entire* request including the body, as one
+		// absolute deadline. At 30s it silently cut off device uploads that took longer
+		// than that to stream, which an ESP32 pushing a few hundred KB over Wi-Fi and TLS
+		// routinely does. ReadHeaderTimeout still guards the header phase, and the upload
+		// handler caps the payload size.
+		ReadHeaderTimeout: 15 * time.Second,
+		ReadTimeout:       300 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {

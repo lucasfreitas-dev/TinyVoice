@@ -13,6 +13,11 @@ static const size_t WAV_HEADER_SIZE = 44;
 static const size_t BYTES_PER_SECOND = SAMPLE_RATE * sizeof(int16_t);
 static const i2s_port_t I2S_MIC = I2S_NUM_0;
 static const char* REC_DIR = "/rec";
+// One append-only file per take. Creating a file per chunk cost a LittleFS metadata commit
+// and a block-allocator scan every 16 KB, which fell behind the 32 KB/s capture rate and
+// forced a second full-size copy at upload time.
+static const char* TAKE_PATH = "/rec/take.pcm";
+static File s_takeFile;
 static const int INMP441_SHIFT = 14;
 static const size_t I2S_READ_SAMPLES = 256;
 // Capture fills one chunk slot directly and hands it to the flush worker, so there is no
@@ -32,6 +37,8 @@ static AudioRecorder* s_recorderInstance = nullptr;
 // Loudest sample of the current take, so a dead or mis-wired mic is visible in the log.
 static volatile uint32_t s_peakAmplitude = 0;
 
+// Called once per take: lfs_fs_size() walks every allocated block, so it must never run
+// inside the capture loop. Everything after this is tracked with a byte counter.
 static size_t computeMaxPcmBytes() {
     size_t freeBytes = storageFreeBytes();
     if (freeBytes <= FS_UPLOAD_SAFE_BYTES + FS_WRITE_MARGIN) {
@@ -63,24 +70,16 @@ static int s_activeSlot = -1;
 static QueueHandle_t s_flushQueue = nullptr;
 static TaskHandle_t s_flushTask = nullptr;
 
-static void chunkPath(char* path, size_t len, int index) {
-    snprintf(path, len, "%s/c%04d.pcm", REC_DIR, index);
-}
-
+// Appends to the already-open take file. No open/close, no free-space scan: the recorder
+// caps the take by byte count before a chunk ever gets here.
 static bool writeChunkToDisk(const uint8_t* data, size_t len, int chunkIndex) {
+    (void)chunkIndex;
     if (len == 0) {
         return true;
     }
 
-    if (storageFreeBytes() < len + FS_WRITE_MARGIN) {
-        Serial.printf("audio: flash full (need %u, free %u)\n",
-                      (unsigned)(len + FS_WRITE_MARGIN),
-                      (unsigned)storageFreeBytes());
-        return false;
-    }
-
-    if (!LittleFS.exists(REC_DIR) && !LittleFS.mkdir(REC_DIR)) {
-        Serial.println("audio: failed to create /rec");
+    if (!s_takeFile) {
+        Serial.println("audio: take file not open");
         return false;
     }
 
@@ -89,21 +88,11 @@ static bool writeChunkToDisk(const uint8_t* data, size_t len, int chunkIndex) {
         return false;
     }
 
-    char path[24];
-    chunkPath(path, sizeof(path), chunkIndex);
-    File file = LittleFS.open(path, FILE_WRITE);
-    if (!file) {
-        storageUnlock();
-        Serial.println("audio: failed to open pcm chunk");
-        return false;
-    }
-
-    size_t written = file.write(data, len);
-    file.close();
+    size_t written = s_takeFile.write(data, len);
     storageUnlock();
 
     if (written != len) {
-        Serial.println("audio: chunk write failed");
+        Serial.printf("audio: short write %u/%u\n", (unsigned)written, (unsigned)len);
         return false;
     }
     return true;
@@ -173,6 +162,10 @@ bool AudioRecorder::ensureRecordDir() {
 void AudioRecorder::cleanupRecording() {
     waitForPendingFlushes();
 
+    if (s_takeFile) {
+        s_takeFile.close();
+    }
+
     if (!storageLock()) {
         return;
     }
@@ -209,95 +202,8 @@ void AudioRecorder::releaseMemoryForNetwork() {
     _writePos = 0;
 }
 
-bool AudioRecorder::canAssembleUploadWav(size_t pcmBytes) const {
-    size_t needed = pcmBytes + 44 + 4096;
-    return storageFreeBytes() >= needed;
-}
-
-bool AudioRecorder::assembleUploadWav(const char* destPath, const uint8_t* wavHeader,
-                                      size_t pcmBytes, int chunkCount) {
-    waitForPendingFlushes();
-
-    if (!canAssembleUploadWav(pcmBytes)) {
-        Serial.printf("upload: skip assemble (need %u, free %u)\n",
-                      (unsigned)(pcmBytes + 44 + 4096),
-                      (unsigned)storageFreeBytes());
-        return false;
-    }
-
-    if (!ensureRecordDir()) {
-        return false;
-    }
-
-    if (LittleFS.exists(destPath)) {
-        LittleFS.remove(destPath);
-    }
-
-    if (!storageLock()) {
-        Serial.println("upload: assemble lock timeout");
-        return false;
-    }
-
-    File out = LittleFS.open(destPath, FILE_WRITE);
-    if (!out) {
-        storageUnlock();
-        Serial.println("upload: assemble open failed");
-        return false;
-    }
-
-    if (out.write(wavHeader, 44) != 44) {
-        out.close();
-        storageUnlock();
-        LittleFS.remove(destPath);
-        Serial.println("upload: assemble header write failed");
-        return false;
-    }
-
-    size_t copied = 0;
-    uint8_t buf[1024];
-    for (int i = 0; i < chunkCount; i++) {
-        char path[24];
-        snprintf(path, sizeof(path), "/rec/c%04d.pcm", i);
-        File in = LittleFS.open(path, FILE_READ);
-        if (!in) {
-            Serial.printf("upload: missing chunk %s\n", path);
-            out.close();
-            storageUnlock();
-            LittleFS.remove(destPath);
-            return false;
-        }
-
-        while (in.available()) {
-            size_t n = in.read(buf, sizeof(buf));
-            if (n == 0) {
-                break;
-            }
-            if (out.write(buf, n) != n) {
-                in.close();
-                out.close();
-                storageUnlock();
-                LittleFS.remove(destPath);
-                Serial.println("upload: assemble pcm write failed");
-                return false;
-            }
-            copied += n;
-        }
-        in.close();
-        yield();
-    }
-
-    out.close();
-    storageUnlock();
-
-    if (copied != pcmBytes) {
-        Serial.printf("upload: assemble size mismatch (%u != %u)\n",
-                      (unsigned)copied, (unsigned)pcmBytes);
-        LittleFS.remove(destPath);
-        return false;
-    }
-
-    Serial.printf("upload: assembled %u bytes\n", (unsigned)(44 + copied));
-    return true;
+const char* AudioRecorder::takePath() const {
+    return TAKE_PATH;
 }
 
 int AudioRecorder::chunkCount() const {
@@ -480,8 +386,10 @@ bool AudioRecorder::begin() {
     return true;
 }
 
+// Pure arithmetic against the budget computed once at start(); touching the filesystem
+// here is what made long takes drop samples.
 bool AudioRecorder::hasSpaceForChunk(size_t bytes) const {
-    return storageFreeBytes() >= bytes + FS_WRITE_MARGIN;
+    return _pcmTotal + bytes <= _maxPcmBytes;
 }
 
 void AudioRecorder::markFlashLimit() {
@@ -602,6 +510,20 @@ bool AudioRecorder::start() {
         Serial.printf("audio: max recording capped to %u s by flash (safe for upload)\n", maxSec);
     }
 
+    if (!ensureRecordDir()) {
+        return false;
+    }
+    if (!storageLock()) {
+        Serial.println("audio: storage lock timeout on take open");
+        return false;
+    }
+    s_takeFile = LittleFS.open(TAKE_PATH, FILE_WRITE);
+    storageUnlock();
+    if (!s_takeFile) {
+        Serial.println("audio: failed to open take file");
+        return false;
+    }
+
     portENTER_CRITICAL(&ringMux);
     _ringWrite = 0;
     _ringRead = 0;
@@ -711,6 +633,15 @@ size_t AudioRecorder::stop(size_t* outFileLen) {
     }
     writeChunkSync();
     waitForPendingFlushes();
+
+    if (s_takeFile) {
+        if (storageLock()) {
+            s_takeFile.close();
+            storageUnlock();
+        } else {
+            s_takeFile.close();
+        }
+    }
 
     if (_pcmTotal == 0) {
         cleanupRecording();

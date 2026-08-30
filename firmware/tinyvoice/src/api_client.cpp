@@ -169,23 +169,44 @@ void logHttpResult(const char* op, int code) {
 
 const char* MULTIPART_BOUNDARY = "----TinyVoiceBoundary7MA4YWxk";
 
-uint8_t s_bodyBuf[1024];
+// Each write becomes one TLS record and one blocking send, so 1 KB pieces meant ~450
+// round trips for a long take. 4 KB cuts that by four at no meaningful RAM cost.
+uint8_t s_bodyBuf[4096];
 
-// ssl_client sets O_NONBLOCK for its connect timeout and never clears it. That is required
-// for available()/connected() to stay cheap, but during a long send it turns a full LWIP
-// buffer into an EWOULDBLOCK that mbedtls_ssl_write can only spin on until it times out.
-// So switch to blocking sends for the body, then switch back before reading the response.
-void setSocketBlocking(WiFiClientSecure& tls, bool blocking) {
-    int fd = tls.fd();
+// Blocks until the socket can accept data, ticking the LED while it waits.
+//
+// The socket must stay non-blocking (ssl_client sets O_NONBLOCK for its connect timeout).
+// Making it blocking for the body looked like a fix for EWOULDBLOCK spinning, but send()
+// then has no deadline: SO_SNDTIMEO is never set, because setTimeout() only touches socket
+// options once a socket exists and we must call it before connect(). One send blocked for
+// 61 s and wedged the whole TCP session. Waiting for writability first means mbedtls_ssl_write
+// is only ever called when it can make progress, and control stays in this loop.
+bool waitWritable(int fd, unsigned long timeoutMs) {
     if (fd < 0) {
-        return;
+        return false;
     }
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) {
-        return;
-    }
-    fcntl(fd, F_SETFL, blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK));
+    unsigned long start = millis();
+    do {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(fd, &wfds);
+        struct timeval tv = {0, 50000};
+        int r = select(fd + 1, nullptr, &wfds, nullptr, &tv);
+        if (r > 0) {
+            return true;
+        }
+        if (r < 0 && errno != EINTR) {
+            return false;
+        }
+        apiProgressTick();
+    } while (millis() - start < timeoutMs);
+    return false;
 }
+
+// Cumulative bytes handed to TLS for the current request. The per-call counter below says
+// nothing about where a large body actually died, which is the whole question.
+size_t s_bodySent = 0;
+size_t s_bodyNextLog = 0;
 
 // mbedtls_ssl_write may accept only part of the buffer, and HTTPClient gives up after
 // retrying once. Keep pushing until every byte is accepted.
@@ -194,10 +215,25 @@ bool tlsWriteAll(WiFiClientSecure& tls, const uint8_t* data, size_t len) {
     unsigned long lastMoved = millis();
 
     while (sent < len) {
+        unsigned long writeStart = millis();
+        if (!waitWritable(tls.fd(), 15000)) {
+            Serial.printf("upload: socket not writable at %u total (%u/%u this write, "
+                          "errno=%d free=%u)\n",
+                          (unsigned)s_bodySent, (unsigned)sent, (unsigned)len, errno,
+                          ESP.getFreeHeap());
+            return false;
+        }
+
         size_t n = tls.write(data + sent, len - sent);
         if (n > 0) {
             sent += n;
+            s_bodySent += n;
             lastMoved = millis();
+            if (s_bodyNextLog && s_bodySent >= s_bodyNextLog) {
+                Serial.printf("upload: sent %u bytes (free=%u)\n",
+                              (unsigned)s_bodySent, ESP.getFreeHeap());
+                s_bodyNextLog += 65536;
+            }
             apiProgressTick();
             continue;
         }
@@ -205,14 +241,16 @@ bool tlsWriteAll(WiFiClientSecure& tls, const uint8_t* data, size_t len) {
         // write() returns 0 for a stalled socket and for a fatal TLS error alike, so only
         // probe the connection here (connected() can block while the socket is blocking).
         if (!tls.connected()) {
-            Serial.printf("upload: tls closed after %u/%u bytes (errno=%d)\n",
-                          (unsigned)sent, (unsigned)len, errno);
+            Serial.printf("upload: tls closed at %u total (%u/%u this write, "
+                          "blocked %lu ms, errno=%d)\n",
+                          (unsigned)s_bodySent, (unsigned)sent, (unsigned)len,
+                          millis() - writeStart, errno);
             return false;
         }
         if (millis() - lastMoved > 8000) {
-            Serial.printf("upload: tls write stalled at %u/%u bytes "
-                          "(errno=%d free=%u max=%u)\n",
-                          (unsigned)sent, (unsigned)len, errno,
+            Serial.printf("upload: tls stalled at %u total (%u/%u this write, "
+                          "errno=%d free=%u max=%u)\n",
+                          (unsigned)s_bodySent, (unsigned)sent, (unsigned)len, errno,
                           ESP.getFreeHeap(), ESP.getMaxAllocHeap());
             return false;
         }
@@ -274,81 +312,27 @@ bool writeBodyFromFile(WiFiClientSecure& tls, File& file, size_t len) {
     return true;
 }
 
-bool writeBodyFromChunks(WiFiClientSecure& tls, const uint8_t* wavHeader,
-                         size_t pcmBytes, int chunkCount) {
-    if (!tlsWriteAll(tls, wavHeader, 44)) {
-        return false;
-    }
-
-    size_t sent = 0;
-    for (int i = 0; i < chunkCount && sent < pcmBytes; i++) {
-        char path[24];
-        snprintf(path, sizeof(path), "/rec/c%04d.pcm", i);
-
-        if (!storageLock()) {
-            Serial.println("upload: storage lock timeout");
-            return false;
-        }
-        File in = LittleFS.open(path, FILE_READ);
-        storageUnlock();
-        if (!in) {
-            Serial.printf("upload: chunk missing %s\n", path);
-            return false;
-        }
-
-        size_t remaining = in.size();
-        while (remaining > 0) {
-            size_t want = remaining > sizeof(s_bodyBuf) ? sizeof(s_bodyBuf) : remaining;
-            int n = in.read(s_bodyBuf, want);
-            if (n <= 0) {
-                Serial.printf("upload: chunk read failed %s\n", path);
-                in.close();
-                return false;
-            }
-            if (!tlsWriteAll(tls, s_bodyBuf, (size_t)n)) {
-                in.close();
-                return false;
-            }
-            remaining -= (size_t)n;
-            sent += (size_t)n;
-        }
-        in.close();
-    }
-
-    if (sent != pcmBytes) {
-        Serial.printf("upload: chunk total %u != declared %u\n",
-                      (unsigned)sent, (unsigned)pcmBytes);
-        return false;
-    }
-    return true;
-}
-
-// Posts the recording as multipart/form-data straight over TLS. Body comes either from
-// an assembled WAV (filePath) or from the raw PCM chunks plus a synthesized WAV header.
-int postRecording(WiFiClientSecure& tls, const char* filePath,
-                  const uint8_t* wavHeader, size_t pcmBytes, int chunkCount) {
+// Posts the recording as multipart/form-data straight over TLS: the synthesized WAV header
+// followed by the raw PCM take, streamed from flash a kilobyte at a time.
+int postRecording(WiFiClientSecure& tls, const uint8_t* wavHeader, const char* pcmPath) {
     ApiEndpoint ep = parseEndpoint("/api/v1/device/messages");
 
-    File file;
-    size_t bodyLen;
-    if (filePath) {
-        file = LittleFS.open(filePath, FILE_READ);
-        if (!file) {
-            Serial.println("upload: recording file missing");
-            return -1;
-        }
-        bodyLen = file.size();
-        if (bodyLen <= 44) {
-            file.close();
-            Serial.println("upload: recording file empty");
-            return -1;
-        }
-    } else {
-        if (!wavHeader || pcmBytes == 0 || chunkCount <= 0) {
-            return -1;
-        }
-        bodyLen = 44 + pcmBytes;
+    if (!wavHeader || !pcmPath) {
+        return -1;
     }
+
+    File file = LittleFS.open(pcmPath, FILE_READ);
+    if (!file) {
+        Serial.println("upload: take file missing");
+        return -1;
+    }
+    size_t pcmLen = file.size();
+    if (pcmLen == 0) {
+        file.close();
+        Serial.println("upload: take file empty");
+        return -1;
+    }
+    size_t bodyLen = 44 + pcmLen;
 
     char head[192];
     int headLen = snprintf(head, sizeof(head),
@@ -380,37 +364,46 @@ int postRecording(WiFiClientSecure& tls, const char* filePath,
     }
 
     Serial.printf("api: %s:%u%s\n", ep.host.c_str(), ep.port, ep.uri.c_str());
-    tls.setTimeout(10);
+    // Must be set before connect(): start_ssl_client copies this into socket_timeout, and
+    // setTimeout() only touches the socket options once a socket exists. WiFiClientSecure
+    // reacts to a write timeout by calling stop(), so a short fuse turns a transient TCP
+    // stall into a dead session with nothing left to retry on.
+    tls.setTimeout(30);
+    unsigned long connectStart = millis();
     if (!tls.connect(ep.host.c_str(), ep.port)) {
-        Serial.println("upload: tls connect failed");
-        if (file) {
-            file.close();
-        }
+        Serial.printf("upload: tls connect failed after %lu ms\n", millis() - connectStart);
+        file.close();
         return -1;
     }
 
-    setSocketBlocking(tls, true);
+    s_bodySent = 0;
+    s_bodyNextLog = 65536;
 
-    Serial.printf("upload: tls up fd=%d (free=%u max=%u)\n",
-                  tls.fd(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    Serial.printf("upload: tls up in %lu ms fd=%d (free=%u max=%u)\n",
+                  millis() - connectStart, tls.fd(),
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
     bool ok = tlsWriteAll(tls, (const uint8_t*)req, (size_t)reqLen) &&
               tlsWriteAll(tls, (const uint8_t*)head, (size_t)headLen);
 
     if (ok) {
-        ok = filePath ? writeBodyFromFile(tls, file, bodyLen)
-                      : writeBodyFromChunks(tls, wavHeader, pcmBytes, chunkCount);
+        ok = tlsWriteAll(tls, wavHeader, 44) && writeBodyFromFile(tls, file, pcmLen);
     }
     if (ok) {
         ok = tlsWriteAll(tls, (const uint8_t*)tail, (size_t)tailLen);
     }
 
-    if (file) {
-        file.close();
-    }
-    setSocketBlocking(tls, false);
+    file.close();
 
     if (!ok) {
+        // A peer that rejects the request (auth, size, bad multipart) answers and closes
+        // while we are still writing, which surfaces as a reset. Read whatever arrived so
+        // the real status shows up instead.
+        if (tls.available() > 0) {
+            int early = readHttpStatus(tls, 2000);
+            Serial.printf("upload: server rejected early with status %d\n", early);
+            return early;
+        }
         return -1;
     }
 
@@ -419,17 +412,18 @@ int postRecording(WiFiClientSecure& tls, const char* filePath,
     return readHttpStatus(tls, 60000);
 }
 
-int postRecordingWithRetry(const char* filePath, const uint8_t* wavHeader,
-                           size_t pcmBytes, int chunkCount) {
+int postRecordingWithRetry(const uint8_t* wavHeader, const char* pcmPath) {
     int code = -1;
 
     for (int attempt = 1; attempt <= 2; attempt++) {
         releaseClients();
-        delay(attempt == 1 ? 200 : 1500);
+        // A torn-down session leaves lwIP cleaning up the fd; reconnecting too soon gets
+        // ECONNABORTED on the same descriptor and burns the retry.
+        delay(attempt == 1 ? 200 : 4000);
 
         WiFiClientSecure tls;
         tls.setInsecure();
-        code = postRecording(tls, filePath, wavHeader, pcmBytes, chunkCount);
+        code = postRecording(tls, wavHeader, pcmPath);
         tls.stop();
 
         if (code == 200 || code == 201) {
@@ -961,7 +955,7 @@ bool ApiClient::uploadAudioFile(const char* path) {
     return code == 201 || code == 200;
 }
 
-bool ApiClient::uploadRecordingFile(const char* path) {
+bool ApiClient::uploadRecordingPcm(const uint8_t* wavHeader, const char* pcmPath) {
     ApiLock lock;
     if (!lock.held()) {
         return false;
@@ -969,25 +963,7 @@ bool ApiClient::uploadRecordingFile(const char* path) {
     Serial.printf("upload: heap free=%u min=%u max=%u\n",
                   ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
 
-    int code = postRecordingWithRetry(path, nullptr, 0, 0);
-    releaseConnections();
-
-    if (code != 200 && code != 201) {
-        Serial.printf("upload: rejected (status %d)\n", code);
-        return false;
-    }
-    return true;
-}
-
-bool ApiClient::uploadRecordingStream(const uint8_t* wavHeader, size_t pcmBytes, int chunkCount) {
-    ApiLock lock;
-    if (!lock.held()) {
-        return false;
-    }
-    Serial.printf("upload: streaming %u pcm bytes, heap max=%u\n",
-                  (unsigned)pcmBytes, ESP.getMaxAllocHeap());
-
-    int code = postRecordingWithRetry(nullptr, wavHeader, pcmBytes, chunkCount);
+    int code = postRecordingWithRetry(wavHeader, pcmPath);
     releaseConnections();
 
     if (code != 200 && code != 201) {
