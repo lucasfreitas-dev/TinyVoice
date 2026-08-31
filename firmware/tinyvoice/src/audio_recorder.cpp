@@ -36,6 +36,13 @@ static int16_t s_ringBuffer[RING_SAMPLE_COUNT];
 static AudioRecorder* s_recorderInstance = nullptr;
 // Loudest sample of the current take, so a dead or mis-wired mic is visible in the log.
 static volatile uint32_t s_peakAmplitude = 0;
+static void (*s_progressTick)() = nullptr;
+
+static void tickProgress() {
+    if (s_progressTick) {
+        s_progressTick();
+    }
+}
 
 // Called once per take: lfs_fs_size() walks every allocated block, so it must never run
 // inside the capture loop. Everything after this is tracked with a byte counter.
@@ -480,8 +487,13 @@ void AudioRecorder::waitForPendingFlushes() {
             return;
         }
         delay(10);
+        tickProgress();
     }
     Serial.println("audio: flush wait timeout");
+}
+
+void AudioRecorder::setProgressTick(void (*fn)()) {
+    s_progressTick = fn;
 }
 
 bool AudioRecorder::start() {
@@ -626,6 +638,7 @@ size_t AudioRecorder::stop(size_t* outFileLen) {
     _recording = false;
     for (int i = 0; i < 100; i++) {
         loop();
+        tickProgress();
         if (_ringCount == 0) {
             break;
         }

@@ -263,6 +263,7 @@ void setup() {
         Serial.println("audio init failed");
         stateMachine.onError("audio_init_failed");
     }
+    audioRecorder.setProgressTick(uploadProgressTick);
     if (audioPlayer.begin()) {
         audioPlayer.playBootChime();
     }
@@ -316,6 +317,9 @@ void handleRecording() {
         } else if (audioRecorder.maxDurationReached()) {
             Serial.println("recording stopped: max safe length");
         }
+        // Blink as soon as the user lets go. stop() still has to drain the ring
+        // and wait for flash, which used to leave the button solid until upload.
+        led.update(DeviceState::UPLOADING, stateMachine.hasPendingMessage());
         size_t fileLen = 0;
         size_t pcmBytes = audioRecorder.stop(&fileLen);
 

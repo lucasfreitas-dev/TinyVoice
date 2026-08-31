@@ -22,6 +22,15 @@ void Led::begin() {
 }
 
 void Led::update(DeviceState state, bool hasPendingMessage) {
+    if (state != _currentState) {
+        _lastBlinkMs = millis();
+        // The arcade button only has the green LED, so RECORDING (solid green)
+        // and UPLOADING-on look identical. Start the blink cycle off so the
+        // light drops the moment recording ends.
+        if (state == DeviceState::UPLOADING || state == DeviceState::DOWNLOADING) {
+            _blinkOn = false;
+        }
+    }
     _currentState = state;
     _hasPending = hasPendingMessage;
     applyOutputs();

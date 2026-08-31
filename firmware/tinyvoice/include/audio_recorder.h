@@ -25,6 +25,7 @@ public:
     size_t recordedPcmBytes() const;
     void waitForPendingFlushes();
     void markFlashLimit();
+    void setProgressTick(void (*fn)());
 
 private:
     volatile bool _recording;
