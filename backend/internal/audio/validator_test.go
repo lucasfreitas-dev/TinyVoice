@@ -3,6 +3,7 @@ package audio
 import (
 	"bytes"
 	"encoding/binary"
+	"os"
 	"testing"
 )
 
@@ -99,9 +100,52 @@ func TestValidateWAVWithLISTChunk(t *testing.T) {
 	}
 }
 
-func TestValidateWAVInvalidFormat(t *testing.T) {
-	_, err := ValidateWAV(bytes.NewReader([]byte("not a wav")), 1024)
+func TestValidateWAVTooLong(t *testing.T) {
+	byteRate := uint32(32000)
+	dataSize := uint32(32000 * 61) // 61 seconds
+	header := buildWAVHeader(dataSize, byteRate)
+	_, err := ValidateWAV(bytes.NewReader(header), 10*1024*1024)
 	if err == nil {
-		t.Fatal("expected error")
+		t.Fatal("expected error for long recording")
 	}
+}
+
+func TestTrimToMaxDurationNoOp(t *testing.T) {
+	byteRate := uint32(32000)
+	dataSize := uint32(32000) // 1 second
+	header := buildWAVHeader(dataSize, byteRate)
+
+	f, err := os.CreateTemp("", "trim-noop-*.wav")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := f.Name()
+	defer os.Remove(path)
+	if _, err := f.Write(header); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := TrimToMaxDuration(path); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	info, err := ValidateWAV(bytes.NewReader(mustRead(t, path)), 1024*1024)
+	if err != nil {
+		t.Fatalf("validate after trim: %v", err)
+	}
+	if info.DurationMs != 1000 {
+		t.Fatalf("expected 1000ms, got %d", info.DurationMs)
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }

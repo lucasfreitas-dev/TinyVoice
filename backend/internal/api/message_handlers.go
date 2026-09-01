@@ -20,11 +20,11 @@ import (
 )
 
 type MessageHandlers struct {
-	messages   *message.Service
-	devices    *device.Repository
-	storage    storage.Provider
-	logger     *slog.Logger
-	maxUpload  int64
+	messages  *message.Service
+	devices   *device.Repository
+	storage   storage.Provider
+	logger    *slog.Logger
+	maxUpload int64
 }
 
 func NewMessageHandlers(
@@ -72,6 +72,11 @@ func (h *MessageHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer os.Remove(tmpPath)
+
+	if err := audio.TrimToMaxDuration(tmpPath); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+		return
+	}
 
 	f, err := os.Open(tmpPath)
 	if err != nil {

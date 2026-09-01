@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 )
 
 const (
@@ -94,7 +95,7 @@ func parseWAVHeader(r io.Reader) (byteRate, dataSize, riffSize uint32, err error
 }
 
 func ConvertToOpus(inputPath, outputPath string) error {
-	cmd := exec.Command("ffmpeg", "-y", "-i", inputPath,
+	cmd := exec.Command("ffmpeg", "-y", "-t", maxDurationSeconds(), "-i", inputPath,
 		"-c:a", "libopus", "-b:a", "64k", "-vbr", "on",
 		"-ac", "1", "-ar", "16000", outputPath)
 	cmd.Stderr = os.Stderr
@@ -105,11 +106,47 @@ func ConvertToOpus(inputPath, outputPath string) error {
 }
 
 func ConvertToWAV(inputPath, outputPath string) error {
-	cmd := exec.Command("ffmpeg", "-y", "-i", inputPath,
+	cmd := exec.Command("ffmpeg", "-y", "-t", maxDurationSeconds(), "-i", inputPath,
 		"-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", outputPath)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("ffmpeg convert to wav: %w", err)
+	}
+	return nil
+}
+
+func maxDurationSeconds() string {
+	return strconv.FormatFloat(float64(MaxDurationMs)/1000, 'f', 3, 64)
+}
+
+// TrimToMaxDuration rewrites path in place if the WAV is longer than MaxDurationMs.
+// Shorter files are left untouched. Used for device uploads that skip ConvertToWAV.
+func TrimToMaxDuration(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open wav: %w", err)
+	}
+	byteRate, dataSize, _, err := parseWAVHeader(f)
+	f.Close()
+	if err != nil {
+		return err
+	}
+	if byteRate == 0 {
+		return fmt.Errorf("invalid wav byte rate")
+	}
+	durationMs := int(dataSize) * 1000 / int(byteRate)
+	if durationMs <= MaxDurationMs {
+		return nil
+	}
+
+	tmp := path + ".trim"
+	if err := ConvertToWAV(path, tmp); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("replace trimmed wav: %w", err)
 	}
 	return nil
 }

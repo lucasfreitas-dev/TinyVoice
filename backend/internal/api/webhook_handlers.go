@@ -63,10 +63,10 @@ type evolutionWebhook struct {
 		} `json:"key"`
 		Message struct {
 			AudioMessage *struct {
-				URL       string `json:"url"`
-				Mimetype  string `json:"mimetype"`
-				Seconds   int    `json:"seconds"`
-				Ptt       bool   `json:"ptt"`
+				URL      string `json:"url"`
+				Mimetype string `json:"mimetype"`
+				Seconds  int    `json:"seconds"`
+				Ptt      bool   `json:"ptt"`
 			} `json:"audioMessage"`
 		} `json:"message"`
 		MessageType string `json:"messageType"`
@@ -168,6 +168,13 @@ func (h *WebhookHandlers) Evolution(w http.ResponseWriter, r *http.Request) {
 		h.logger.Error("whatsapp_error", slog.String("error", err.Error()))
 		http.Error(w, `{"error":"convert failed"}`, http.StatusInternalServerError)
 		return
+	}
+	if am := payload.Data.Message.AudioMessage; am != nil && am.Seconds > audio.MaxDurationMs/1000 {
+		h.logger.Info("inbound_audio_trimmed",
+			slog.String("external_id", externalID),
+			slog.Int("original_seconds", am.Seconds),
+			slog.Int("kept_seconds", audio.MaxDurationMs/1000),
+		)
 	}
 
 	wavFile, err := os.Open(wavPath)
