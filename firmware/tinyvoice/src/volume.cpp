@@ -18,7 +18,7 @@
 
 static const int ADC_MAX = 4095;
 static const int FLOATING_SPREAD = 400;
-static const unsigned long POLL_INTERVAL_MS = 25;
+static const unsigned long VOLUME_POLL_INTERVAL_MS = 25;
 
 static float clampf(float v, float lo, float hi) {
     if (v < lo) return lo;
@@ -100,7 +100,7 @@ void VolumeControl::poll() {
         return;
     }
     unsigned long now = millis();
-    if (_lastReadMs != 0 && (now - _lastReadMs) < POLL_INTERVAL_MS) {
+    if (_lastReadMs != 0 && (now - _lastReadMs) < VOLUME_POLL_INTERVAL_MS) {
         return;
     }
     _lastReadMs = now;
