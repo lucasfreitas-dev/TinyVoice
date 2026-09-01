@@ -559,8 +559,13 @@ void loop() {
         if (s_pollOk) {
             noteApiSuccess();
             if (s_pollMsg.available) {
+                bool isNew = pendingMessageId[0] == '\0' ||
+                             strcmp(pendingMessageId, s_pollMsg.id) != 0;
                 strlcpy(pendingMessageId, s_pollMsg.id, sizeof(pendingMessageId));
                 Serial.printf("poll: message available id=%s\n", pendingMessageId);
+                if (isNew) {
+                    audioPlayer.playRingtone();
+                }
             } else {
                 Serial.printf("poll: no message (free=%u max=%u)\n",
                               ESP.getFreeHeap(), ESP.getMaxAllocHeap());

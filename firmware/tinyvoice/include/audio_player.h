@@ -8,6 +8,7 @@ class AudioPlayer {
 public:
     bool begin();
     void playBootChime();
+    void playRingtone();
     bool play(const uint8_t* wavData, size_t len);
     bool playFile(const char* path);
     bool isPlaying() const;

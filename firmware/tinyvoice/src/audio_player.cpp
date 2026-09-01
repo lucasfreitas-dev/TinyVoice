@@ -151,6 +151,27 @@ void AudioPlayer::playBootChime() {
     Serial.println("audio: boot chime played");
 }
 
+void AudioPlayer::playRingtone() {
+    if (!_ready) {
+        return;
+    }
+
+    _playing = true;
+    // Two-burst "ring-ring" so a new message is distinct from the boot chime.
+    const float lo = 880.00f;    // A5
+    const float hi = 1174.66f;   // D6
+    for (int burst = 0; burst < 2; burst++) {
+        playTone(lo, 160);
+        delay(40);
+        playTone(hi, 240);
+        if (burst == 0) {
+            delay(180);
+        }
+    }
+    _playing = false;
+    Serial.println("audio: ringtone played");
+}
+
 bool AudioPlayer::play(const uint8_t* wavData, size_t len) {
     if (!_ready || len <= 44) return false;
 
