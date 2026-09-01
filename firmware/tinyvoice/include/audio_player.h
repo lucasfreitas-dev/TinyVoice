@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "volume.h"
 
 class AudioPlayer {
 public:
@@ -11,9 +12,11 @@ public:
     bool playFile(const char* path);
     bool isPlaying() const;
     void loop();
+    float volumeGain() const;
 
 private:
     bool _ready;
     bool _playing;
+    VolumeControl _volume;
     void playTone(float hz, int durationMs);
 };

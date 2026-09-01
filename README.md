@@ -4,7 +4,7 @@ TinyVoice is a physical audio messaging box based on ESP32. A child holds a butt
 
 ## Architecture
 
-- **ESP32 firmware** — INMP441 microphone, MAX98357A amplifier, button, LED
+- **ESP32 firmware** — INMP441 microphone, MAX98357A amplifier, button, LED, optional volume pot
 - **Go API** — REST backend with PostgreSQL and MinIO
 - **Evolution API** — WhatsApp integration
 - **Docker Compose** — home server stack with Caddy reverse proxy

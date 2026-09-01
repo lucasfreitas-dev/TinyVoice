@@ -16,3 +16,4 @@ constexpr int BUTTON_PIN    = 4;
 constexpr int LED_GREEN_PIN = 17;  // arcade button built-in LED (+ 220Ω)
 constexpr int LED_RED_PIN   = 16;  // optional external RGB
 constexpr int LED_BLUE_PIN  = 18;  // optional external RGB
+constexpr int VOLUME_POT_PIN = 34;  // ADC1_CH6 — analog volume pot (input-only)

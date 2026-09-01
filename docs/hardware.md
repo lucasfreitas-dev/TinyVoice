@@ -1,6 +1,6 @@
 # TinyVoice — Hardware & Wiring
 
-Esquema de ligação para o protótipo com **ESP32-WROOM-32** (dev board genérica), **INMP441**, **MAX98357A**, **botão arcade** (com LED integrado) e **alto-falante 4 Ω / 3 W**.
+Esquema de ligação para o protótipo com **ESP32-WROOM-32** (dev board genérica), **INMP441**, **MAX98357A**, **botão arcade** (com LED integrado), **potenciômetro de volume** e **alto-falante 4 Ω / 3 W**.
 
 > Todos os GPIOs ficam centralizados em [`firmware/tinyvoice/include/pins.h`](../firmware/tinyvoice/include/pins.h). Altere apenas lá se precisar remapear pinos.
 
@@ -15,8 +15,10 @@ Esquema de ligação para o protótipo com **ESP32-WROOM-32** (dev board genéri
 | 3 | MAX98357A (breakout roxo) | Amplificador I2S 3 W |
 | 4 | Alto-falante 4 Ω / 3 W | Saída de áudio |
 | 5 | Botão arcade verde | Gravar / reproduzir |
-| 6 | Breadboard + jumpers | Prototipagem |
-| 7 | Resistores 220 Ω (×1 ou ×3) | LED do botão ou LED RGB |
+| 6 | Potenciômetro 10 kΩ linear (B10K) | Volume da reprodução (ADC) |
+| 7 | Resistor 2,2 kΩ | Piso de volume (mínimo ≠ mudo) |
+| 8 | Breadboard + jumpers | Prototipagem |
+| 9 | Resistores 220 Ω (×1 ou ×3) | LED do botão ou LED RGB |
 
 ---
 
@@ -34,6 +36,7 @@ Esquema de ligação para o protótipo com **ESP32-WROOM-32** (dev board genéri
 | LED verde (botão) | **17** | Via resistor 220 Ω |
 | LED vermelho (erro) | **16** | Opcional; ou use RGB |
 | LED azul (gravação) | **18** | Opcional; ou use RGB |
+| Potenciômetro de volume | **34** | ADC1; pino só-entrada. Não use ADC2 (conflita com Wi-Fi) |
 
 **Pinos evitados:** GPIO 0, 2, 12, 15 (strapping/boot), GPIO 6–11 (flash SPI).
 
@@ -74,8 +77,13 @@ Esquema de ligação para o protótipo com **ESP32-WROOM-32** (dev board genéri
     │ NO  ───┼── GPIO 4     │  GND ────────────── LED - (botão)  │
     │ LED+ ──┼── [220Ω]── GPIO 17                                   │
     │ LED- ──┼── GND       │                                     │
-    └────────┘              │  USB-C ← alimentação               │
-                            └─────────────────────────────────────┘
+    └────────┘              │                                     │
+    Potenciômetro 10 kΩ     │  GPIO 34 ── wiper do pot            │
+    ┌────────┐              │  3.3V ──── CW (máximo)              │
+    │ CW  ───┼── 3.3V       │  GND  ──── 2.2 kΩ ── CCW (mínimo)   │
+    │ WIPER ─┼── GPIO 34    │                                     │
+    │ CCW ───┼── [2.2k]─GND │  USB-C ← alimentação               │
+    └────────┘              └─────────────────────────────────────┘
 ```
 
 ---
@@ -174,6 +182,46 @@ Se preferir um LED RGB separado para os estados (BOOT, gravação, mensagem, err
 
 Tipo **cátodo comum:** GPIO → resistor → anodo da cor; catodos juntos no GND.
 
+### 5. Potenciômetro de volume (GPIO 34)
+
+O MAX98357A é um amp **Class D** com entrada **I2S digital**. **Não** coloque o potenciômetro entre o amp e o alto-falante: a saída é PWM e um pot ali esquenta, distorce e pode danificar o módulo.
+
+O volume é um divisor resistivo lido no ADC. O firmware escala o PCM em tempo real (o knob vale durante a reprodução). O ganho mínimo é **~18%** — o fundo de escala continua audível, nunca mudo.
+
+| Pino do pot (10 kΩ) | Conectar a |
+|---------------------|------------|
+| CW (sentido horário = mais alto) | **3.3 V** |
+| Wiper (cursor) | **GPIO 34** |
+| CCW (mínimo) | Resistor **2,2 kΩ** → **GND** |
+
+```
+ESP32          Pot 10 kΩ              Piso
+─────          ─────────              ────
+3.3V ───────── CW
+GPIO34 ─────── WIPER
+GND  ──[2.2k]─ CCW
+```
+
+**Por que o 2,2 kΩ:** no fim de curso o divisor fica `2,2k / (10k + 2,2k) ≈ 18% de 3,3 V` (~0,60 V). O ADC nunca chega a 0 V. Sem o resistor o firmware ainda aplica o mesmo piso em software (`VOLUME_MIN_GAIN`); o 2,2 kΩ é o piso **físico** do divisor.
+
+**Pino ADC:** GPIO 34 é ADC1 (não conflita com Wi-Fi). É só-entrada: sem pull-up interno. Caixas sem pot ficam com o pino flutuando — o firmware detecta isso no boot e usa volume máximo.
+
+Opcional, se quiser volume máximo com o pot desconectado sem depender da detecção: **100 kΩ** entre GPIO 34 e 3.3 V. O pot de 10 kΩ prevalece quando estiver ligado.
+
+**Não use** o pino GAIN do MAX98357A como volume: ele só escolhe degraus fixos (3 / 6 / 9 / 12 / 15 dB), não um contínuo.
+
+Ajuste fino em `config.h`:
+
+| Define | Padrão | Efeito |
+|--------|--------|--------|
+| `VOLUME_POT_ENABLED` | `1` | `0` desliga o ADC e fixa o ganho máximo |
+| `VOLUME_MIN_GAIN` | `0.18` | Piso de amplitude (nunca mudo). Suba para um mínimo mais alto |
+| `VOLUME_MAX_GAIN` | `1.00` | Teto; baixe se o 9 dB do amp ainda saturar |
+
+O firmware aplica uma curva quadrática no curso do pot linear (B10K) para o ajuste parecer mais natural. Um pot logarítmico (A10K) também funciona, mas comprime um pouco mais o lado baixo.
+
+Se o sentido do knob estiver invertido, troque 3.3 V e o 2,2 kΩ/GND nos extremos do pot. Um capacitor de **100 nF** entre GPIO 34 e GND (opcional) suaviza ruído do ADC.
+
 ---
 
 ## GND comum e alimentação
@@ -183,7 +231,7 @@ USB 5V ──► ESP32 VIN/5V ──► MAX98357A Vin
                 │
                 └── regulador onboard ──► 3.3V ──► INMP441, ESP32, MAX98357 SD
 
-Todos os GND (ESP32, INMP441, MAX98357A, botão, LED, breadboard rails) ──► GND comum
+Todos os GND (ESP32, INMP441, MAX98357A, botão, LED, pot, breadboard rails) ──► GND comum
 ```
 
 | Rail breadboard | Origem |
@@ -206,7 +254,7 @@ Todos os GND (ESP32, INMP441, MAX98357A, botão, LED, breadboard rails) ──�
          │  │  │
          │  │  └──────────────────────── MAX98357A ── fios ── Speaker
          │  └─────────────────────────── INMP441 (longe do speaker!)
-         └────────────────────────────── Botão (fora da breadboard)
+         └────────────────────────────── Botão + pot de volume (fora da breadboard)
 
     INMP441: fixe com fita; evite vibração e sopros diretos no furo do mic.
     Speaker: apoiado ao lado; não encostar no microfone (feedback).
@@ -219,7 +267,7 @@ Todos os GND (ESP32, INMP441, MAX98357A, botão, LED, breadboard rails) ──�
 | De | Para |
 |----|------|
 | ESP32 3.3V | INMP441 VDD |
-| ESP32 GND | INMP441 GND, INMP441 L/R, MAX98357 GND, botão COM, LED−, trilho GND |
+| ESP32 GND | INMP441 GND, INMP441 L/R, MAX98357 GND, botão COM, LED−, pot (via 2,2 kΩ), trilho GND |
 | ESP32 GPIO 14 | INMP441 SCK |
 | ESP32 GPIO 15 | INMP441 WS |
 | ESP32 GPIO 32 | INMP441 SD |
@@ -233,6 +281,9 @@ Todos os GND (ESP32, INMP441, MAX98357A, botão, LED, breadboard rails) ──�
 | ESP32 GND | Botão COM |
 | ESP32 GPIO 17 → 220Ω | Botão LED+ |
 | ESP32 GND | Botão LED− |
+| ESP32 3.3V | Pot CW (máximo) |
+| ESP32 GPIO 34 | Pot wiper |
+| Pot CCW → 2,2 kΩ | ESP32 GND (piso ≠ mudo) |
 
 ---
 
@@ -243,6 +294,7 @@ Todos os GND (ESP32, INMP441, MAX98357A, botão, LED, breadboard rails) ──�
 3. **MAX98357 SD:** em 3.3 V (amp desligado se em GND).
 4. **Speaker:** 4 Ω no terminal correto (não deixar solto com amp ligado).
 5. **GPIO 4:** só NO + COM; NC isolado.
+6. **Volume:** wiper no GPIO 34; 2,2 kΩ entre CCW e GND; **não** ligar o pot no alto-falante.
 
 ---
 
@@ -252,7 +304,6 @@ Todos os GND (ESP32, INMP441, MAX98357A, botão, LED, breadboard rails) ──�
 |---------|---------------------------|
 | Botão iluminado PWM | GPIO 17 (já usado) |
 | Sensor presença (PIR) | GPIO 13 |
-| Controle volume (potenciômetro) | GPIO 34 (ADC1) |
 | Display I2C (SSD1306) | GPIO 21 SDA, GPIO 22 SCL |
 | Bateria + carregador | VIN via TP4056; monitor opcional GPIO 35 |
 
@@ -275,4 +326,5 @@ constexpr int BUTTON_PIN      = 4;
 constexpr int LED_GREEN_PIN   = 17;  // LED integrado do botão arcade
 constexpr int LED_RED_PIN     = 16;  // opcional RGB
 constexpr int LED_BLUE_PIN    = 18;  // opcional RGB
+constexpr int VOLUME_POT_PIN  = 34;  // ADC1 — potenciômetro de volume
 ```

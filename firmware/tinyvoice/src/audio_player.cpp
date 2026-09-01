@@ -6,6 +6,38 @@
 #include <math.h>
 #include <string.h>
 
+static void applyPcmGain(uint8_t* buf, size_t nbytes, float gain) {
+    if (buf == nullptr || nbytes < 2) {
+        return;
+    }
+    if (gain >= 0.999f) {
+        return;
+    }
+    if (gain < 0.0f) {
+        gain = 0.0f;
+    }
+    int32_t q15 = (int32_t)(gain * 32768.0f + 0.5f);
+    if (q15 < 0) {
+        q15 = 0;
+    }
+    if (q15 > 32768) {
+        q15 = 32768;
+    }
+    size_t samples = nbytes / 2;
+    for (size_t i = 0; i < samples; i++) {
+        int16_t sample = (int16_t)(buf[i * 2] | ((uint16_t)buf[i * 2 + 1] << 8));
+        int32_t scaled = (sample * q15) >> 15;
+        if (scaled > 32767) {
+            scaled = 32767;
+        }
+        if (scaled < -32768) {
+            scaled = -32768;
+        }
+        buf[i * 2] = (uint8_t)(scaled & 0xFF);
+        buf[i * 2 + 1] = (uint8_t)((scaled >> 8) & 0xFF);
+    }
+}
+
 static const int SAMPLE_RATE = 16000;
 static const i2s_port_t I2S_SPK = I2S_NUM_1;
 
@@ -64,6 +96,7 @@ bool AudioPlayer::begin() {
     if (i2s_set_pin(I2S_SPK, &pin_cfg) != ESP_OK) return false;
     _ready = false;
     _playing = false;
+    _volume.begin();
     _ready = true;
     return true;
 }
@@ -73,6 +106,7 @@ void AudioPlayer::playTone(float hz, int durationMs) {
         return;
     }
 
+    _volume.poll();
     int16_t buf[256];
     int totalSamples = (SAMPLE_RATE * durationMs) / 1000;
     int produced = 0;
@@ -89,7 +123,7 @@ void AudioPlayer::playTone(float hz, int durationMs) {
             float attack = progress < 0.08f ? progress / 0.08f : 1.0f;
             float release = progress > 0.80f ? (1.0f - progress) / 0.20f : 1.0f;
             float env = attack * release;
-            float sample = sinf(2.0f * PI * hz * t) * 7000.0f * env;
+            float sample = sinf(2.0f * PI * hz * t) * 7000.0f * env * _volume.gain();
             if (sample > 32767.0f) sample = 32767.0f;
             if (sample < -32768.0f) sample = -32768.0f;
             buf[i] = (int16_t)sample;
@@ -98,6 +132,7 @@ void AudioPlayer::playTone(float hz, int durationMs) {
         size_t bytesWritten = 0;
         i2s_write(I2S_SPK, buf, block * sizeof(int16_t), &bytesWritten, portMAX_DELAY);
         produced += block;
+        _volume.poll();
     }
 }
 
@@ -130,11 +165,15 @@ bool AudioPlayer::play(const uint8_t* wavData, size_t len) {
     size_t written = 0;
 
     _playing = true;
+    uint8_t buf[512];
     while (written < pcmLen) {
         size_t chunk = pcmLen - written;
-        if (chunk > 512) chunk = 512;
+        if (chunk > sizeof(buf)) chunk = sizeof(buf);
+        memcpy(buf, pcm + written, chunk);
+        _volume.poll();
+        applyPcmGain(buf, chunk, _volume.gain());
         size_t bytesWritten = 0;
-        i2s_write(I2S_SPK, pcm + written, chunk, &bytesWritten, portMAX_DELAY);
+        i2s_write(I2S_SPK, buf, chunk, &bytesWritten, portMAX_DELAY);
         written += bytesWritten;
         yield();
     }
@@ -180,6 +219,8 @@ bool AudioPlayer::playFile(const char* path) {
         if (n == 0) {
             break;
         }
+        _volume.poll();
+        applyPcmGain(buf, n, _volume.gain());
         size_t bytesWritten = 0;
         i2s_write(I2S_SPK, buf, n, &bytesWritten, portMAX_DELAY);
         written += n;
@@ -193,4 +234,8 @@ bool AudioPlayer::playFile(const char* path) {
 
 bool AudioPlayer::isPlaying() const { return _playing; }
 
-void AudioPlayer::loop() {}
+float AudioPlayer::volumeGain() const { return _volume.gain(); }
+
+void AudioPlayer::loop() {
+    _volume.poll();
+}
