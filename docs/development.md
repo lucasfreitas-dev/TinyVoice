@@ -62,6 +62,12 @@ pio device monitor
 
 See [hardware.md](hardware.md).
 
+### Volume pot
+
+A 10 kΩ pot on **GPIO 34** (ADC1) scales playback. The floor (`VOLUME_MIN_GAIN`, default `0.18`) keeps the lowest setting audible. Boxes without a pot keep full volume.
+
+Tune in `config.h` after copying `config.example.h`: `VOLUME_POT_ENABLED`, `VOLUME_MIN_GAIN`, `VOLUME_MAX_GAIN`.
+
 ## Environment Variables
 
 See [.env.example](../.env.example).

@@ -20,5 +20,11 @@
 #define HOLD_THRESHOLD_MS 300
 #define DEBOUNCE_MS 50
 
+// Hardware volume pot on GPIO 34 (ADC1). Minimum is never mute.
+// Existing boxes without a pot keep full volume (floating-pin detect).
+#define VOLUME_POT_ENABLED 1
+#define VOLUME_MIN_GAIN 0.18f
+#define VOLUME_MAX_GAIN 1.00f
+
 // API
 #define API_TIMEOUT_MS 30000

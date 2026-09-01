@@ -478,6 +478,7 @@ void loop() {
         startNetWorker();
     }
     button.loop();
+    audioPlayer.loop();
     led.setWiFiConnected(wifiManager.isConnected());
     led.loop();
 

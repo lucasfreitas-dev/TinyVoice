@@ -85,5 +85,7 @@ Files are streamed — never loaded fully into memory for HTTP responses.
 Prepared but not implemented in MVP:
 
 - Captive portal Wi-Fi setup
-- Battery / presence sensor / volume / display
+- Battery / presence sensor / display
 - WebSocket push (polling is sufficient for MVP)
+
+Volume pot on GPIO 34 is implemented: ADC reading scales PCM playback, and the minimum gain is never mute.
