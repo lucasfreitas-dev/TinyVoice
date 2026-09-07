@@ -5,6 +5,7 @@ enum class DeviceState {
     CONNECTING_WIFI,
     IDLE,
     RECORDING,
+    PROCESSING,
     UPLOADING,
     CHECKING_MESSAGES,
     DOWNLOADING,

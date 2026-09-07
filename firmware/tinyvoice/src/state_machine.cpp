@@ -7,6 +7,7 @@ const char* stateToString(DeviceState state) {
         case DeviceState::CONNECTING_WIFI: return "CONNECTING_WIFI";
         case DeviceState::IDLE: return "IDLE";
         case DeviceState::RECORDING: return "RECORDING";
+        case DeviceState::PROCESSING: return "PROCESSING";
         case DeviceState::UPLOADING: return "UPLOADING";
         case DeviceState::CHECKING_MESSAGES: return "CHECKING_MESSAGES";
         case DeviceState::DOWNLOADING: return "DOWNLOADING";
@@ -57,12 +58,12 @@ void StateMachine::onButtonHoldStart() {
 
 void StateMachine::onButtonRelease() {
     if (_state == DeviceState::RECORDING) {
-        transition(DeviceState::UPLOADING);
+        transition(DeviceState::PROCESSING);
     }
 }
 
 void StateMachine::onUploadStart() {
-    if (_state == DeviceState::IDLE) {
+    if (_state == DeviceState::IDLE || _state == DeviceState::PROCESSING) {
         transition(DeviceState::UPLOADING);
     }
 }

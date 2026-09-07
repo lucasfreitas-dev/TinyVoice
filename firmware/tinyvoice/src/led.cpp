@@ -1,19 +1,36 @@
 #include "led.h"
 #include "pins.h"
 #include <Arduino.h>
+#include <math.h>
+
+static const int GREEN_LEDC_CH = 0;
+static const int GREEN_LEDC_FREQ = 5000;
+static const int GREEN_LEDC_BITS = 8;
 
 static const unsigned long WIFI_PHASE_MS[] = {150, 150, 150, 700};
+static const unsigned UPLOAD_ON_MS[] = {100, 300, 600};
+static const unsigned DOWNLOAD_ON_MS[] = {600, 300, 100};
+static const unsigned PULSE_OFF_MS = 180;
+static const unsigned FAST_PULSE_MS = 50;
+static const unsigned TRIM_BLINK_MS = 400;
+static const unsigned long BREATHE_PERIOD_MS = 1800;
+static const uint8_t BREATHE_MIN = 32;
+static const uint8_t BREATHE_MAX = 255;
 
 void Led::begin() {
-    pinMode(LED_GREEN_PIN, OUTPUT);
+    ledcSetup(GREEN_LEDC_CH, GREEN_LEDC_FREQ, GREEN_LEDC_BITS);
+    ledcAttachPin(LED_GREEN_PIN, GREEN_LEDC_CH);
+    ledcWrite(GREEN_LEDC_CH, 0);
+
     pinMode(LED_RED_PIN, OUTPUT);
     pinMode(LED_BLUE_PIN, OUTPUT);
-    digitalWrite(LED_GREEN_PIN, LOW);
     digitalWrite(LED_RED_PIN, LOW);
     digitalWrite(LED_BLUE_PIN, LOW);
+
     _lastBlinkMs = 0;
     _wifiPatternMs = 0;
     _wifiPhase = 0;
+    _pulsePhase = 0;
     _blinkOn = false;
     _wifiConnected = true;
     _currentState = DeviceState::BOOT;
@@ -25,11 +42,12 @@ void Led::begin() {
 void Led::update(DeviceState state, bool hasPendingMessage) {
     if (state != _currentState) {
         _lastBlinkMs = millis();
-        // The arcade button only has the green LED, so RECORDING (solid green)
-        // and UPLOADING-on look identical. Start the blink cycle off so the
-        // light drops the moment recording ends.
-        if (state == DeviceState::UPLOADING || state == DeviceState::DOWNLOADING) {
+        _pulsePhase = 0;
+        // Drop off solid recording immediately, then start the pulse cadence.
+        if (state == DeviceState::PROCESSING) {
             _blinkOn = false;
+        } else {
+            _blinkOn = true;
         }
     }
     _currentState = state;
@@ -70,6 +88,7 @@ bool Led::wifiPatternActive() const {
         case DeviceState::BOOT:
         case DeviceState::CONNECTING_WIFI:
         case DeviceState::RECORDING:
+        case DeviceState::PROCESSING:
         case DeviceState::UPLOADING:
         case DeviceState::PLAYING:
         case DeviceState::DOWNLOADING:
@@ -79,62 +98,103 @@ bool Led::wifiPatternActive() const {
     }
 }
 
-void Led::applyOutputs() {
-    digitalWrite(LED_RED_PIN, LOW);
-    digitalWrite(LED_GREEN_PIN, LOW);
-    digitalWrite(LED_BLUE_PIN, LOW);
+bool Led::needsBreathe() const {
+    if (wifiPatternActive() || !_hasPending) {
+        return false;
+    }
+    return _currentState == DeviceState::IDLE ||
+           _currentState == DeviceState::CHECKING_MESSAGES;
+}
 
-    // Wi-Fi down: double-blink on green (visible on arcade button LED)
+unsigned Led::pulseStepMs() const {
+    switch (_currentState) {
+        case DeviceState::PROCESSING:
+            return FAST_PULSE_MS;
+        case DeviceState::UPLOADING:
+            return _blinkOn ? UPLOAD_ON_MS[_pulsePhase % 3] : PULSE_OFF_MS;
+        case DeviceState::DOWNLOADING:
+            return _blinkOn ? DOWNLOAD_ON_MS[_pulsePhase % 3] : PULSE_OFF_MS;
+        case DeviceState::PLAYING:
+            return _trimHint ? TRIM_BLINK_MS : 0;
+        default:
+            return 0;
+    }
+}
+
+uint8_t Led::breatheDuty(unsigned long now) const {
+    const float kPi = 3.14159265f;
+    float x = (2.0f * kPi * (float)(now % BREATHE_PERIOD_MS)) / (float)BREATHE_PERIOD_MS;
+    float s = 0.5f * (1.0f + sinf(x - kPi / 2.0f));
+    return (uint8_t)(BREATHE_MIN + (BREATHE_MAX - BREATHE_MIN) * s);
+}
+
+void Led::writeGreen(uint8_t duty) {
+    ledcWrite(GREEN_LEDC_CH, duty);
+}
+
+void Led::writeRgb(bool red, bool blue) {
+    digitalWrite(LED_RED_PIN, red ? HIGH : LOW);
+    digitalWrite(LED_BLUE_PIN, blue ? HIGH : LOW);
+}
+
+void Led::applyOutputs() {
+    writeRgb(false, false);
+    writeGreen(0);
+
     if (wifiPatternActive()) {
         if (_wifiPhase == 0 || _wifiPhase == 2) {
-            digitalWrite(LED_GREEN_PIN, HIGH);
-            digitalWrite(LED_RED_PIN, HIGH);
+            writeGreen(255);
+            writeRgb(true, false);
         }
         return;
     }
 
     switch (_currentState) {
         case DeviceState::BOOT:
-            digitalWrite(LED_RED_PIN, HIGH);
-            digitalWrite(LED_GREEN_PIN, HIGH);
-            digitalWrite(LED_BLUE_PIN, HIGH);
+            writeGreen(255);
+            writeRgb(true, true);
             break;
         case DeviceState::CONNECTING_WIFI:
-            digitalWrite(LED_RED_PIN, HIGH);
-            digitalWrite(LED_GREEN_PIN, HIGH);
+            writeGreen(255);
+            writeRgb(true, false);
             break;
         case DeviceState::RECORDING:
-            digitalWrite(LED_GREEN_PIN, HIGH);
-            digitalWrite(LED_BLUE_PIN, HIGH);
+            writeGreen(255);
+            writeRgb(false, true);
+            break;
+        case DeviceState::PROCESSING:
+            if (_blinkOn) {
+                writeGreen(255);
+            }
             break;
         case DeviceState::UPLOADING:
             if (_blinkOn) {
-                digitalWrite(LED_GREEN_PIN, HIGH);
+                writeGreen(255);
             }
             break;
         case DeviceState::DOWNLOADING:
             if (_blinkOn) {
-                digitalWrite(LED_GREEN_PIN, HIGH);
-                digitalWrite(LED_BLUE_PIN, HIGH);
+                writeGreen(255);
+                writeRgb(false, true);
             }
             break;
         case DeviceState::PLAYING:
             if (_trimHint) {
                 if (_blinkOn) {
-                    digitalWrite(LED_GREEN_PIN, HIGH);
+                    writeGreen(255);
                 }
             } else {
-                digitalWrite(LED_GREEN_PIN, HIGH);
+                writeGreen(255);
             }
             break;
         case DeviceState::ERROR:
-            digitalWrite(LED_RED_PIN, HIGH);
+            writeRgb(true, false);
             break;
         default:
             if (_hasPending) {
-                digitalWrite(LED_GREEN_PIN, HIGH);
+                writeGreen(breatheDuty(millis()));
             } else if (_pressedHint) {
-                digitalWrite(LED_GREEN_PIN, HIGH);
+                writeGreen(255);
             }
             break;
     }
@@ -152,13 +212,21 @@ void Led::loop() {
         return;
     }
 
-    if (now - _lastBlinkMs > 400) {
+    if (needsBreathe()) {
+        applyOutputs();
+        return;
+    }
+
+    unsigned step = pulseStepMs();
+    if (step == 0) {
+        return;
+    }
+    if (now - _lastBlinkMs >= step) {
         _lastBlinkMs = now;
-        _blinkOn = !_blinkOn;
-        if (_currentState == DeviceState::UPLOADING ||
-            _currentState == DeviceState::DOWNLOADING ||
-            (_currentState == DeviceState::PLAYING && _trimHint)) {
-            applyOutputs();
+        if (_blinkOn) {
+            _pulsePhase++;
         }
+        _blinkOn = !_blinkOn;
+        applyOutputs();
     }
 }

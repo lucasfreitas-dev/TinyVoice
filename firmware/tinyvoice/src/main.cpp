@@ -328,8 +328,10 @@ void handleRecording() {
         } else if (audioRecorder.maxDurationReached()) {
             Serial.println("recording stopped: max safe length");
         }
-        // Blink as soon as the take ends so the arcade button shows UPLOADING.
-        led.update(DeviceState::UPLOADING, stateMachine.hasPendingMessage());
+        // Fast pulse while stop() drains the ring and flushes LittleFS.
+        stateMachine.onButtonRelease();
+        led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+        Serial.printf("state: %s\n", stateToString(stateMachine.current()));
         size_t fileLen = 0;
         size_t pcmBytes = audioRecorder.stop(&fileLen);
 
@@ -338,9 +340,8 @@ void handleRecording() {
             if (durationMs >= MIN_RECORDING_MS) {
                 uint8_t wavHeader[44];
                 audioRecorder.buildWavHeader(wavHeader, pcmBytes);
-                stateMachine.onButtonRelease();
                 requestUpload(wavHeader, pcmBytes, audioRecorder.chunkCount());
-                led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+                stateMachine.onUploadStart();
                 Serial.printf("state: %s\n", stateToString(stateMachine.current()));
                 Serial.flush();
             } else {
@@ -354,9 +355,7 @@ void handleRecording() {
             stateMachine.onRecordingCancelled();
         }
 
-        if (stateMachine.current() != DeviceState::UPLOADING) {
-            led.update(stateMachine.current(), stateMachine.hasPendingMessage());
-        }
+        led.update(stateMachine.current(), stateMachine.hasPendingMessage());
     }
 }
 
@@ -520,8 +519,12 @@ void loop() {
 
     bool buttonActive = button.isPressed() || button.isHeld();
 
-    // Light button LED whenever the switch is pressed (except during playback)
-    if (state != DeviceState::PLAYING && state != DeviceState::RECORDING) {
+    // Light button LED whenever the switch is pressed (except during owned states)
+    if (state != DeviceState::PLAYING &&
+        state != DeviceState::RECORDING &&
+        state != DeviceState::PROCESSING &&
+        state != DeviceState::UPLOADING &&
+        state != DeviceState::DOWNLOADING) {
         led.setPressedHint(button.isPressed());
     } else {
         led.setPressedHint(false);
@@ -616,6 +619,7 @@ void loop() {
         stateMachine.current() != DeviceState::DOWNLOADING &&
         stateMachine.current() != DeviceState::PLAYING &&
         stateMachine.current() != DeviceState::RECORDING &&
+        stateMachine.current() != DeviceState::PROCESSING &&
         !buttonActive &&
         !s_netBusy &&
         millis() - lastHeartbeatMs > 60000) {
@@ -653,7 +657,8 @@ void loop() {
         }
     }
 
-    if (stateMachine.current() != DeviceState::RECORDING) {
+    if (stateMachine.current() != DeviceState::RECORDING &&
+        stateMachine.current() != DeviceState::PROCESSING) {
         delay(10);
     }
 }
