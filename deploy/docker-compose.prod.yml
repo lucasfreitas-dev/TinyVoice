@@ -1,7 +1,11 @@
 # Production overrides — do not expose internal services publicly.
 # Usage:
 #   docker compose --env-file ../.env -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Postgres is published on loopback only so DBeaver can SSH-tunnel to it.
+# Do not change this to 0.0.0.0 / "5432:5432".
 
 services:
   postgres:
-    ports: !reset []
+    ports:
+      - "127.0.0.1:5432:5432"
