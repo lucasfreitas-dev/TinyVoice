@@ -18,6 +18,7 @@ private:
     bool _shortPress;
     bool _release;
     bool _stableDown;
+    bool _rawDown;
     unsigned long _pressStartMs;
     unsigned long _lastChangeMs;
 };

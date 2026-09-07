@@ -5,6 +5,9 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <cstring>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <driver/i2s.h>
 #include <esp_heap_caps.h>
 
@@ -17,7 +20,8 @@ static const char* REC_DIR = "/rec";
 // and a block-allocator scan every 16 KB, which fell behind the 32 KB/s capture rate and
 // forced a second full-size copy at upload time.
 static const char* TAKE_PATH = "/rec/take.pcm";
-static File s_takeFile;
+static const char* TAKE_VFS_PATH = "/littlefs/rec/take.pcm";
+static int s_takeFd = -1;
 static const int INMP441_SHIFT = 14;
 static const size_t I2S_READ_SAMPLES = 256;
 // Capture fills one chunk slot directly and hands it to the flush worker, so there is no
@@ -77,6 +81,25 @@ static int s_activeSlot = -1;
 static QueueHandle_t s_flushQueue = nullptr;
 static TaskHandle_t s_flushTask = nullptr;
 
+static void closeTakeFd() {
+    if (s_takeFd >= 0) {
+        ::close(s_takeFd);
+        s_takeFd = -1;
+    }
+}
+
+static bool openTakeFd(bool append) {
+    closeTakeFd();
+    int flags = O_WRONLY | O_CREAT;
+    flags |= append ? O_APPEND : O_TRUNC;
+    s_takeFd = ::open(TAKE_VFS_PATH, flags, 0666);
+    if (s_takeFd < 0) {
+        Serial.printf("audio: open take fd failed errno=%d\n", errno);
+        return false;
+    }
+    return true;
+}
+
 // Appends to the already-open take file. No open/close, no free-space scan: the recorder
 // caps the take by byte count before a chunk ever gets here.
 static bool writeChunkToDisk(const uint8_t* data, size_t len, int chunkIndex) {
@@ -85,7 +108,7 @@ static bool writeChunkToDisk(const uint8_t* data, size_t len, int chunkIndex) {
         return true;
     }
 
-    if (!s_takeFile) {
+    if (s_takeFd < 0) {
         Serial.println("audio: take file not open");
         return false;
     }
@@ -95,13 +118,37 @@ static bool writeChunkToDisk(const uint8_t* data, size_t len, int chunkIndex) {
         return false;
     }
 
-    size_t written = s_takeFile.write(data, len);
-    storageUnlock();
-
-    if (written != len) {
-        Serial.printf("audio: short write %u/%u\n", (unsigned)written, (unsigned)len);
-        return false;
+    size_t written = 0;
+    const size_t kPiece = 4096;
+    while (written < len) {
+        size_t want = len - written;
+        if (want > kPiece) {
+            want = kPiece;
+        }
+        ssize_t n = ::write(s_takeFd, data + written, want);
+        if (n < 0) {
+            n = 0;
+        }
+        if ((size_t)n != want && errno == EBADF) {
+            // TLS teardown on the net worker has been seen to invalidate the Arduino
+            // FILE* (errno 9) after ~1–3 s. Reopen append and retry this piece.
+            Serial.println("audio: take fd lost, reopening");
+            if (openTakeFd(true)) {
+                n = ::write(s_takeFd, data + written, want);
+                if (n < 0) {
+                    n = 0;
+                }
+            }
+        }
+        if (n <= 0) {
+            Serial.printf("audio: short write %u/%u (errno=%d)\n",
+                          (unsigned)written, (unsigned)len, errno);
+            storageUnlock();
+            return false;
+        }
+        written += (size_t)n;
     }
+    storageUnlock();
     return true;
 }
 
@@ -150,7 +197,7 @@ static void startFlushWorker() {
             nullptr,
             4,
             &s_flushTask,
-            0
+            1
         );
     }
 }
@@ -169,9 +216,7 @@ bool AudioRecorder::ensureRecordDir() {
 void AudioRecorder::cleanupRecording() {
     waitForPendingFlushes();
 
-    if (s_takeFile) {
-        s_takeFile.close();
-    }
+    closeTakeFd();
 
     if (!storageLock()) {
         return;
@@ -409,7 +454,7 @@ void AudioRecorder::markFlashLimit() {
     }
     _diskFull = true;
     _recording = false;
-    Serial.println("audio: flash limit reached (safe for upload)");
+    Serial.println("audio: flash limit reached, waiting for button release");
 }
 
 bool AudioRecorder::writeChunkSync() {
@@ -435,44 +480,10 @@ bool AudioRecorder::writeChunkSync() {
 }
 
 bool AudioRecorder::queueChunkFlush() {
-    if (_writePos == 0 || _diskFull) {
-        return true;
-    }
-
-    if (!hasSpaceForChunk(_writePos)) {
-        markFlashLimit();
-        return false;
-    }
-
-    if (s_activeSlot < 0 || !s_flushQueue) {
-        return writeChunkSync();
-    }
-
-    // Capture can only be handed off if there is another slot to continue into; otherwise
-    // write this one here, which keeps the ring draining instead of stalling on the worker.
-    int nextSlot = 0;
-    if (!acquireFlushSlot(nextSlot, 500)) {
-        return writeChunkSync();
-    }
-
-    int filled = s_activeSlot;
-    s_flushSlots[filled].len = _writePos;
-    s_flushSlots[filled].chunkIndex = _nextChunkIndex;
-
-    uint8_t slotIdx = (uint8_t)filled;
-    if (xQueueSend(s_flushQueue, &slotIdx, 0) != pdTRUE) {
-        s_slotFree[nextSlot] = true;
-        return writeChunkSync();
-    }
-
-    s_activeSlot = nextSlot;
-    _staging = s_flushSlots[nextSlot].data;
-
-    _pcmTotal += _writePos;
-    _writePos = 0;
-    _nextChunkIndex++;
-    _chunkCount++;
-    return true;
+    // Write on this task (the Arduino loop). The File object is not safe to use from
+    // the flush worker: after ~7×16 KB the background fwrite returned 0 and the take
+    // died at 3.6 s even though ~43 s of flash was still free.
+    return writeChunkSync();
 }
 
 void AudioRecorder::waitForPendingFlushes() {
@@ -555,6 +566,7 @@ bool AudioRecorder::start() {
     // Capture keeps filling the ring through this blocking setup so speech is not lost.
     storagePruneForRecording();
     cleanupRecording();
+    storageReclaimForTake();
 
     _maxPcmBytes = computeMaxPcmBytes();
     if (_maxPcmBytes < BYTES_PER_SECOND / 2) {
@@ -577,9 +589,9 @@ bool AudioRecorder::start() {
         disarm();
         return false;
     }
-    s_takeFile = LittleFS.open(TAKE_PATH, FILE_WRITE);
+    bool opened = openTakeFd(false);
     storageUnlock();
-    if (!s_takeFile) {
+    if (!opened) {
         Serial.println("audio: failed to open take file");
         disarm();
         return false;
@@ -698,13 +710,11 @@ size_t AudioRecorder::stop(size_t* outFileLen) {
     writeChunkSync();
     waitForPendingFlushes();
 
-    if (s_takeFile) {
-        if (storageLock()) {
-            s_takeFile.close();
-            storageUnlock();
-        } else {
-            s_takeFile.close();
-        }
+    if (storageLock()) {
+        closeTakeFd();
+        storageUnlock();
+    } else {
+        closeTakeFd();
     }
 
     // queueChunkFlush counts PCM when the slot is queued; a flush timeout can
@@ -764,7 +774,7 @@ unsigned AudioRecorder::maxRecordingSeconds() const {
 }
 
 void AudioRecorder::loop() {
-    if (!s_takeFile || _ringCount == 0) {
+    if (s_takeFd < 0 || _ringCount == 0) {
         return;
     }
 

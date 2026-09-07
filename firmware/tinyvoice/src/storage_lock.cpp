@@ -99,3 +99,16 @@ void storageCleanupRecDir() {
 
     storageUnlock();
 }
+
+void storageReclaimForTake() {
+    // LittleFS has no explicit GC; deleting leftover inbound/queue files is how
+    // blocks become free again. Do not use exists() — it logs when the file is missing.
+    LittleFS.remove("/play.wav");
+    if (storageFreeBytes() < 512000) {
+        storagePruneForRecording();
+    }
+    Serial.printf("storage: reclaim free %u / %u (used %u)\n",
+                  (unsigned)storageFreeBytes(),
+                  (unsigned)LittleFS.totalBytes(),
+                  (unsigned)LittleFS.usedBytes());
+}

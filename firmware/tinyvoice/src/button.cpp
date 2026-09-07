@@ -24,7 +24,8 @@ void Button::begin() {
     _release = false;
     _pressStartMs = 0;
     _lastChangeMs = millis();
-    _stableDown = isDown();
+    _rawDown = isDown();
+    _stableDown = _rawDown;
     Serial.printf("button init: gpio=%d raw=%s\n", BUTTON_PIN, _stableDown ? "DOWN" : "UP");
 }
 
@@ -36,30 +37,36 @@ void Button::loop() {
     bool reading = isDown();
     unsigned long now = millis();
 
-    if (reading != _stableDown) {
-        if (now - _lastChangeMs >= (unsigned long)DEBOUNCE_MS) {
-            _lastChangeMs = now;
-            _stableDown = reading;
+    // Restart the stability window on every raw edge. The previous logic only
+    // enforced a gap between *accepted* edges, so a bounce 50 ms after press
+    // counted as a real release and started the upload while the button was held.
+    if (reading != _rawDown) {
+        _rawDown = reading;
+        _lastChangeMs = now;
+    }
 
-            if (reading) {
-                _pressed = true;
-                _held = false;
-                _pressStartMs = now;
-                Serial.println("button: down");
-            } else {
-                if (_pressed && !_held) {
-                    _shortPress = true;
-                    Serial.println("button: short press");
-                }
-                _pressed = false;
-                _held = false;
-                _release = true;
-                Serial.println("button: up");
+    if (_rawDown != _stableDown &&
+        now - _lastChangeMs >= (unsigned long)DEBOUNCE_MS) {
+        _stableDown = _rawDown;
+
+        if (_stableDown) {
+            _pressed = true;
+            _held = false;
+            _pressStartMs = now;
+            Serial.println("button: down");
+        } else {
+            if (_pressed && !_held) {
+                _shortPress = true;
+                Serial.println("button: short press");
             }
+            _pressed = false;
+            _held = false;
+            _release = true;
+            Serial.println("button: up");
         }
     }
 
-    if (_pressed && !_held && _stableDown && reading &&
+    if (_pressed && !_held && _stableDown &&
         now - _pressStartMs >= (unsigned long)HOLD_THRESHOLD_MS) {
         _held = true;
         _justHeld = true;

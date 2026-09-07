@@ -19,6 +19,7 @@ void Led::begin() {
     _currentState = DeviceState::BOOT;
     _hasPending = false;
     _pressedHint = false;
+    _trimHint = false;
 }
 
 void Led::update(DeviceState state, bool hasPendingMessage) {
@@ -48,6 +49,16 @@ void Led::setWiFiConnected(bool connected) {
     _wifiConnected = connected;
     _wifiPhase = 0;
     _wifiPatternMs = millis();
+    applyOutputs();
+}
+
+void Led::setTrimHint(bool trimmed) {
+    if (_trimHint == trimmed) {
+        return;
+    }
+    _trimHint = trimmed;
+    _lastBlinkMs = millis();
+    _blinkOn = true;
     applyOutputs();
 }
 
@@ -108,7 +119,13 @@ void Led::applyOutputs() {
             }
             break;
         case DeviceState::PLAYING:
-            digitalWrite(LED_GREEN_PIN, HIGH);
+            if (_trimHint) {
+                if (_blinkOn) {
+                    digitalWrite(LED_GREEN_PIN, HIGH);
+                }
+            } else {
+                digitalWrite(LED_GREEN_PIN, HIGH);
+            }
             break;
         case DeviceState::ERROR:
             digitalWrite(LED_RED_PIN, HIGH);
@@ -139,7 +156,8 @@ void Led::loop() {
         _lastBlinkMs = now;
         _blinkOn = !_blinkOn;
         if (_currentState == DeviceState::UPLOADING ||
-            _currentState == DeviceState::DOWNLOADING) {
+            _currentState == DeviceState::DOWNLOADING ||
+            (_currentState == DeviceState::PLAYING && _trimHint)) {
             applyOutputs();
         }
     }

@@ -13,6 +13,7 @@ public:
     bool playFile(const char* path);
     bool isPlaying() const;
     void loop();
+    void setProgressTick(void (*fn)());
     float volumeGain() const;
 
 private:

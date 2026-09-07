@@ -9,6 +9,7 @@ public:
     void update(DeviceState state, bool hasPendingMessage);
     void setPressedHint(bool pressed);
     void setWiFiConnected(bool connected);
+    void setTrimHint(bool trimmed);
     void loop();
 
 private:
@@ -20,6 +21,7 @@ private:
     DeviceState _currentState;
     bool _hasPending;
     bool _pressedHint;
+    bool _trimHint;
 
     bool wifiPatternActive() const;
     void applyOutputs();

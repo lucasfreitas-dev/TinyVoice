@@ -8,3 +8,4 @@ void storageUnlock();
 size_t storageFreeBytes();
 void storagePruneForRecording();
 void storageCleanupRecDir();
+void storageReclaimForTake();

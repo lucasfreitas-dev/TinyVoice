@@ -973,7 +973,10 @@ bool ApiClient::uploadRecordingPcm(const uint8_t* wavHeader, const char* pcmPath
     return true;
 }
 
-bool ApiClient::downloadAudioToFile(const char* messageId, const char* path) {
+bool ApiClient::downloadAudioToFile(const char* messageId, const char* path, bool* trimmedOut) {
+    if (trimmedOut) {
+        *trimmedOut = false;
+    }
     ApiLock lock;
     if (!lock.held()) {
         Serial.println("download: api lock timeout");
@@ -1118,6 +1121,9 @@ bool ApiClient::downloadAudioToFile(const char* messageId, const char* path) {
     downloadTls.stop();
 
     if (trimmed || (len > 0 && received < (size_t)len && received >= cap)) {
+        if (trimmedOut) {
+            *trimmedOut = true;
+        }
         Serial.printf("download: saved %u of %d bytes (trimmed to fit flash)\n",
                       (unsigned)received, len);
         return received >= kMinBytes;

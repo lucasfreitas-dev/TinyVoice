@@ -42,6 +42,7 @@ static const int SAMPLE_RATE = 16000;
 static const i2s_port_t I2S_SPK = I2S_NUM_1;
 
 static AudioPins pins;
+static void (*s_playTick)() = nullptr;
 
 static size_t findWavPcmOffset(const uint8_t* wavData, size_t len) {
     if (len < 12 || memcmp(wavData, "RIFF", 4) != 0 || memcmp(wavData + 8, "WAVE", 4) != 0) {
@@ -245,6 +246,9 @@ bool AudioPlayer::playFile(const char* path) {
         size_t bytesWritten = 0;
         i2s_write(I2S_SPK, buf, n, &bytesWritten, portMAX_DELAY);
         written += n;
+        if (s_playTick) {
+            s_playTick();
+        }
         yield();
     }
     f.close();
@@ -254,6 +258,10 @@ bool AudioPlayer::playFile(const char* path) {
 }
 
 bool AudioPlayer::isPlaying() const { return _playing; }
+
+void AudioPlayer::setProgressTick(void (*fn)()) {
+    s_playTick = fn;
+}
 
 float AudioPlayer::volumeGain() const { return _volume.gain(); }
 

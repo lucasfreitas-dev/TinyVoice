@@ -23,7 +23,7 @@ public:
     // Sends the 44-byte WAV header followed by the raw PCM take, so nothing has to be
     // concatenated into a second file first.
     bool uploadRecordingPcm(const uint8_t* wavHeader, const char* pcmPath);
-    bool downloadAudioToFile(const char* messageId, const char* path);
+    bool downloadAudioToFile(const char* messageId, const char* path, bool* trimmed);
     bool markPlayed(const char* messageId);
     void releaseConnections();
 

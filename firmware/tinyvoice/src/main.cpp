@@ -273,6 +273,7 @@ void setup() {
     }
     audioRecorder.setProgressTick(uploadProgressTick);
     if (audioPlayer.begin()) {
+        audioPlayer.setProgressTick(uploadProgressTick);
         audioPlayer.playBootChime();
     }
 
@@ -319,14 +320,15 @@ bool uploadPendingRecording() {
 void handleRecording() {
     audioRecorder.loop();
 
-    if (button.wasRelease() || audioRecorder.maxDurationReached() || audioRecorder.flashLimitReached()) {
+    if ((button.wasRelease() && !button.isPressed()) ||
+        audioRecorder.maxDurationReached() ||
+        audioRecorder.flashLimitReached()) {
         if (audioRecorder.flashLimitReached()) {
-            Serial.println("recording stopped: flash limit (upload safe)");
+            Serial.println("recording stopped: flash limit");
         } else if (audioRecorder.maxDurationReached()) {
             Serial.println("recording stopped: max safe length");
         }
-        // Blink as soon as the user lets go. stop() still has to drain the ring
-        // and wait for flash, which used to leave the button solid until upload.
+        // Blink as soon as the take ends so the arcade button shows UPLOADING.
         led.update(DeviceState::UPLOADING, stateMachine.hasPendingMessage());
         size_t fileLen = 0;
         size_t pcmBytes = audioRecorder.stop(&fileLen);
@@ -362,6 +364,7 @@ static const char* INBOUND_PLAY_PATH = "/play.wav";
 
 static volatile bool s_downloadTaskDone = false;
 static volatile bool s_inboundReady = false;
+static volatile bool s_inboundTrimmed = false;
 static char s_downloadMessageId[40] = {0};
 
 static volatile bool s_pollTaskDone = false;
@@ -377,7 +380,9 @@ static void runDownloadJob() {
     Serial.printf("download: after memory release free=%u max=%u\n",
                   ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
-    bool ok = apiClient.downloadAudioToFile(s_downloadMessageId, INBOUND_PLAY_PATH);
+    bool trimmed = false;
+    bool ok = apiClient.downloadAudioToFile(s_downloadMessageId, INBOUND_PLAY_PATH, &trimmed);
+    s_inboundTrimmed = trimmed;
 
     if (ok) {
         stateMachine.onDownloadComplete();
@@ -442,13 +447,19 @@ static void handleInboundPlayback() {
     }
     s_inboundReady = false;
 
+    led.setTrimHint(s_inboundTrimmed);
     led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+    if (s_inboundTrimmed) {
+        Serial.println("playback: message was trimmed to fit flash");
+    }
 
     if (!audioPlayer.playFile(INBOUND_PLAY_PATH)) {
         Serial.println("audio: playback failed");
     }
     LittleFS.remove(INBOUND_PLAY_PATH);
     pendingMessageId[0] = '\0';
+    s_inboundTrimmed = false;
+    led.setTrimHint(false);
     stateMachine.onPlaybackComplete();
     led.update(stateMachine.current(), stateMachine.hasPendingMessage());
     Serial.println("playback: complete");
@@ -543,6 +554,7 @@ void loop() {
 
     // Button: hold to record (only when no pending message to play)
     if (button.wasJustHeld() && canArmRecord) {
+        waitForNetIdle(10000);
         stateMachine.onButtonHoldStart();
         if (stateMachine.current() == DeviceState::RECORDING) {
             if (!audioRecorder.start()) {
