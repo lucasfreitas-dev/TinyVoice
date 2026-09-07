@@ -508,6 +508,21 @@ void loop() {
         led.setPressedHint(false);
     }
 
+    // Capture into the ring as soon as the button is down so the hold threshold
+    // and file setup cannot clip the first words. Discarded on a short press.
+    const bool canArmRecord =
+        wifiManager.isConnected() &&
+        !stateMachine.hasPendingMessage() &&
+        !audioRecorder.isRecording() &&
+        (state == DeviceState::IDLE ||
+         state == DeviceState::CHECKING_MESSAGES ||
+         state == DeviceState::ERROR);
+    if (button.isPressed() && canArmRecord) {
+        audioRecorder.arm();
+    } else if (!audioRecorder.isRecording()) {
+        audioRecorder.disarm();
+    }
+
     // Button: short press to play pending message (quick tap < HOLD_THRESHOLD_MS)
     if (button.wasShortPress() && stateMachine.hasPendingMessage()) {
         Serial.println("button: play requested");
@@ -519,17 +534,12 @@ void loop() {
     }
 
     // Button: hold to record (only when no pending message to play)
-    if (button.wasJustHeld() &&
-        wifiManager.isConnected() &&
-        !stateMachine.hasPendingMessage() &&
-        (state == DeviceState::IDLE ||
-         state == DeviceState::CHECKING_MESSAGES ||
-         state == DeviceState::ERROR)) {
+    if (button.wasJustHeld() && canArmRecord) {
         stateMachine.onButtonHoldStart();
         if (stateMachine.current() == DeviceState::RECORDING) {
-            waitForNetIdle(5000);
             if (!audioRecorder.start()) {
                 Serial.println("recording start failed");
+                audioRecorder.disarm();
                 stateMachine.onRecordingCancelled();
             } else {
                 Serial.println("recording started");
@@ -585,6 +595,7 @@ void loop() {
         stateMachine.current() != DeviceState::DOWNLOADING &&
         stateMachine.current() != DeviceState::PLAYING &&
         stateMachine.current() != DeviceState::RECORDING &&
+        !buttonActive &&
         !s_netBusy &&
         millis() - lastHeartbeatMs > 60000) {
         lastHeartbeatMs = millis();

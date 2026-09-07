@@ -8,6 +8,11 @@
 class AudioRecorder {
 public:
     bool begin();
+    // Start filling the ring from the current I2S DMA contents. Call on button down
+    // so speech during the hold threshold and start() setup is not lost.
+    void arm();
+    void disarm();
+    bool isArmed() const;
     bool start();
     size_t stop(size_t* outFileLen);
     bool isRecording() const;
@@ -28,6 +33,7 @@ public:
     void setProgressTick(void (*fn)());
 
 private:
+    volatile bool _capturing;
     volatile bool _recording;
     volatile bool _diskFull;
     unsigned long _startMs;

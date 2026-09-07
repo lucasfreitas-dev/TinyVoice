@@ -234,7 +234,7 @@ void AudioRecorder::captureTaskLoop() {
     int16_t samples[I2S_READ_SAMPLES];
 
     for (;;) {
-        if (!_recording) {
+        if (!_capturing && !_recording) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
@@ -272,7 +272,10 @@ void AudioRecorder::pushRing(const int16_t* samples, size_t count) {
         if (_ringCount >= _ringCapacity) {
             _ringRead = (_ringRead + 1) % _ringCapacity;
             _ringCount--;
-            _droppedSamples++;
+            // Pre-roll is a circular window; only count overruns after the take is committed.
+            if (_recording) {
+                _droppedSamples++;
+            }
         }
         _ring[_ringWrite] = samples[i];
         _ringWrite = (_ringWrite + 1) % _ringCapacity;
@@ -350,6 +353,7 @@ bool AudioRecorder::begin() {
     if (i2s_set_pin(I2S_MIC, &pin_cfg) != ESP_OK) return false;
     i2s_zero_dma_buffer(I2S_MIC);
 
+    _capturing = false;
     _recording = false;
     _diskFull = false;
     _maxPcmBytes = BYTES_PER_SECOND * MAX_RECORDING_SECONDS;
@@ -496,44 +500,9 @@ void AudioRecorder::setProgressTick(void (*fn)()) {
     s_progressTick = fn;
 }
 
-bool AudioRecorder::start() {
-    if (_recording) {
-        Serial.println("audio: already recording");
-        return false;
-    }
-    startFlushWorker();
-    if (!allocateStaging()) {
-        return false;
-    }
-
-    s_recorderInstance = this;
-
-    storagePruneForRecording();
-    cleanupRecording();
-
-    _maxPcmBytes = computeMaxPcmBytes();
-    if (_maxPcmBytes < BYTES_PER_SECOND / 2) {
-        Serial.printf("audio: not enough flash (free %u)\n", (unsigned)storageFreeBytes());
-        return false;
-    }
-
-    unsigned maxSec = (unsigned)(_maxPcmBytes / BYTES_PER_SECOND);
-    if (maxSec < (unsigned)MAX_RECORDING_SECONDS) {
-        Serial.printf("audio: max recording capped to %u s by flash (safe for upload)\n", maxSec);
-    }
-
-    if (!ensureRecordDir()) {
-        return false;
-    }
-    if (!storageLock()) {
-        Serial.println("audio: storage lock timeout on take open");
-        return false;
-    }
-    s_takeFile = LittleFS.open(TAKE_PATH, FILE_WRITE);
-    storageUnlock();
-    if (!s_takeFile) {
-        Serial.println("audio: failed to open take file");
-        return false;
+void AudioRecorder::arm() {
+    if (_recording || _capturing) {
+        return;
     }
 
     portENTER_CRITICAL(&ringMux);
@@ -544,7 +513,83 @@ bool AudioRecorder::start() {
     portEXIT_CRITICAL(&ringMux);
 
     s_peakAmplitude = 0;
-    i2s_zero_dma_buffer(I2S_MIC);
+    // Leave I2S DMA alone: unread buffers are ~0.5 s of audio from just before
+    // the press, which becomes the leading pre-roll.
+    _capturing = true;
+}
+
+void AudioRecorder::disarm() {
+    if (_recording) {
+        return;
+    }
+    _capturing = false;
+
+    portENTER_CRITICAL(&ringMux);
+    _ringWrite = 0;
+    _ringRead = 0;
+    _ringCount = 0;
+    _droppedSamples = 0;
+    portEXIT_CRITICAL(&ringMux);
+}
+
+bool AudioRecorder::isArmed() const {
+    return _capturing && !_recording;
+}
+
+bool AudioRecorder::start() {
+    if (_recording) {
+        Serial.println("audio: already recording");
+        return false;
+    }
+    if (!_capturing) {
+        arm();
+    }
+    startFlushWorker();
+    if (!allocateStaging()) {
+        disarm();
+        return false;
+    }
+
+    s_recorderInstance = this;
+
+    // Capture keeps filling the ring through this blocking setup so speech is not lost.
+    storagePruneForRecording();
+    cleanupRecording();
+
+    _maxPcmBytes = computeMaxPcmBytes();
+    if (_maxPcmBytes < BYTES_PER_SECOND / 2) {
+        Serial.printf("audio: not enough flash (free %u)\n", (unsigned)storageFreeBytes());
+        disarm();
+        return false;
+    }
+
+    unsigned maxSec = (unsigned)(_maxPcmBytes / BYTES_PER_SECOND);
+    if (maxSec < (unsigned)MAX_RECORDING_SECONDS) {
+        Serial.printf("audio: max recording capped to %u s by flash (safe for upload)\n", maxSec);
+    }
+
+    if (!ensureRecordDir()) {
+        disarm();
+        return false;
+    }
+    if (!storageLock()) {
+        Serial.println("audio: storage lock timeout on take open");
+        disarm();
+        return false;
+    }
+    s_takeFile = LittleFS.open(TAKE_PATH, FILE_WRITE);
+    storageUnlock();
+    if (!s_takeFile) {
+        Serial.println("audio: failed to open take file");
+        disarm();
+        return false;
+    }
+
+    portENTER_CRITICAL(&ringMux);
+    _droppedSamples = 0;
+    size_t preroll = _ringCount;
+    portEXIT_CRITICAL(&ringMux);
+
     _writePos = 0;
     _pcmTotal = 0;
     _nextChunkIndex = 0;
@@ -552,6 +597,11 @@ bool AudioRecorder::start() {
     _diskFull = false;
     _startMs = millis();
     _recording = true;
+    // Two bounded drains cover the 1 s ring so pre-roll hits flash before start() returns.
+    loop();
+    loop();
+    Serial.printf("audio: recording with %u preroll samples (~%.0f ms)\n",
+                  (unsigned)preroll, preroll * 1000.0f / SAMPLE_RATE);
     return true;
 }
 
@@ -635,6 +685,7 @@ size_t AudioRecorder::buildWavHeader(uint8_t* header, size_t dataSize) const {
 }
 
 size_t AudioRecorder::stop(size_t* outFileLen) {
+    _capturing = false;
     _recording = false;
     for (int i = 0; i < 100; i++) {
         loop();
@@ -696,7 +747,7 @@ unsigned AudioRecorder::maxRecordingSeconds() const {
 }
 
 void AudioRecorder::loop() {
-    if (_ringCount == 0) {
+    if (!s_takeFile || _ringCount == 0) {
         return;
     }
 
