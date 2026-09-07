@@ -141,6 +141,18 @@ func TestTrimToMaxDurationNoOp(t *testing.T) {
 	}
 }
 
+func TestAlignWAVInfoToFileClampsOverstatedHeader(t *testing.T) {
+	info := &WAVInfo{DurationMs: 3585, SizeBytes: 114732}
+	AlignWAVInfoToFile(info, 98348)
+	if info.SizeBytes != 98348 {
+		t.Fatalf("size=%d", info.SizeBytes)
+	}
+	// (98348-44)*1000/(16000*2) = 3072ms
+	if info.DurationMs != 3072 {
+		t.Fatalf("duration=%d", info.DurationMs)
+	}
+}
+
 func mustRead(t *testing.T, path string) []byte {
 	t.Helper()
 	b, err := os.ReadFile(path)

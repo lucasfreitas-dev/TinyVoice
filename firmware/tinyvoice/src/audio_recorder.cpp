@@ -707,6 +707,23 @@ size_t AudioRecorder::stop(size_t* outFileLen) {
         }
     }
 
+    // queueChunkFlush counts PCM when the slot is queued; a flush timeout can
+    // leave take.pcm shorter than _pcmTotal (one 16 KB slot). The WAV header
+    // must match the bytes actually on flash or MinIO rejects the upload.
+    if (storageLock()) {
+        File onDisk = LittleFS.open(TAKE_PATH, FILE_READ);
+        if (onDisk) {
+            size_t diskBytes = onDisk.size();
+            onDisk.close();
+            if (diskBytes > 0 && diskBytes != _pcmTotal) {
+                Serial.printf("audio: counted %u pcm bytes, disk has %u; using disk\n",
+                              (unsigned)_pcmTotal, (unsigned)diskBytes);
+                _pcmTotal = diskBytes;
+            }
+        }
+        storageUnlock();
+    }
+
     if (_pcmTotal == 0) {
         cleanupRecording();
         if (outFileLen) {

@@ -96,6 +96,18 @@ func (h *MessageHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	st, err := f.Stat()
+	if err != nil {
+		http.Error(w, `{"error":"read failed"}`, http.StatusInternalServerError)
+		return
+	}
+	audio.AlignWAVInfoToFile(info, st.Size())
+
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		http.Error(w, `{"error":"read failed"}`, http.StatusInternalServerError)
+		return
+	}
+
 	msg, err := h.messages.CreateOutbound(r.Context(), d.ID, f, info.SizeBytes, "audio/wav", info.DurationMs)
 	if err != nil {
 		h.logger.Error("recording_upload_failed", slog.String("device_id", d.ID), slog.String("error", err.Error()))

@@ -49,6 +49,25 @@ func ValidateWAV(r io.Reader, maxBytes int64) (*WAVInfo, error) {
 	return &WAVInfo{DurationMs: durationMs, SizeBytes: sizeBytes}, nil
 }
 
+// AlignWAVInfoToFile sets SizeBytes to the bytes actually on disk. If the RIFF
+// header overstates the payload (ESP32 can count a chunk that never reached flash),
+// duration is recalculated from the real PCM length so MinIO Put Content-Length matches.
+func AlignWAVInfoToFile(info *WAVInfo, fileSize int64) {
+	if info == nil || fileSize <= 0 {
+		return
+	}
+	if fileSize >= info.SizeBytes {
+		info.SizeBytes = fileSize
+		return
+	}
+	pcm := fileSize - 44
+	if pcm < 0 {
+		pcm = 0
+	}
+	info.DurationMs = int(pcm) * 1000 / (SampleRate * 2)
+	info.SizeBytes = fileSize
+}
+
 func parseWAVHeader(r io.Reader) (byteRate, dataSize, riffSize uint32, err error) {
 	var riff [12]byte
 	if _, err = io.ReadFull(r, riff[:]); err != nil {
