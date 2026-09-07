@@ -254,6 +254,14 @@ void setup() {
     led.begin();
     ensureStorageDirs();
     storageCleanupRecDir();
+    // A crash mid-download leaves /play.wav filling the partition. exists() logs an
+    // error when the file is missing, so this must not run from the idle queue loop.
+    if (LittleFS.exists("/play.wav")) {
+        LittleFS.remove("/play.wav");
+        Serial.printf("storage: dropped leftover inbound file, free %u / %u\n",
+                      (unsigned)storageFreeBytes(),
+                      (unsigned)LittleFS.totalBytes());
+    }
 
     stateMachine.onBootComplete();
     led.update(stateMachine.current(), stateMachine.hasPendingMessage());

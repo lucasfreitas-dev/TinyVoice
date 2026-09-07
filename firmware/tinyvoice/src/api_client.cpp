@@ -1012,6 +1012,32 @@ bool ApiClient::downloadAudioToFile(const char* messageId, const char* path) {
     if (LittleFS.exists(path)) {
         LittleFS.remove(path);
     }
+
+    // Default LittleFS is 1.4 MB; a 60 s 16 kHz WAV is ~1.9 MB. littlefs panics with
+    // IntegerDivideByZero in lfs_alloc once free blocks hit zero (lookahead size % 0),
+    // including on seek/flush of a file that already filled the partition. Leave spare
+    // blocks for metadata COW, and never rewrite the WAV header afterwards.
+    const size_t kBlock = 4096;
+    const size_t kFlashMargin = 131072;
+    const size_t kMinBytes = 44 + 16000; // 0.5 s of PCM so playback is worth starting
+    size_t freeBytes = storageFreeBytes();
+    if (freeBytes <= kFlashMargin + kMinBytes) {
+        Serial.printf("download: not enough flash (%u free)\n", (unsigned)freeBytes);
+        http.end();
+        downloadTls.stop();
+        return false;
+    }
+    size_t cap = ((freeBytes - kFlashMargin) / kBlock) * (kBlock - 8);
+    cap &= ~(size_t)1;
+    if (len > 0 && (size_t)len < cap) {
+        cap = (size_t)len;
+    }
+    if (len > 0 && (size_t)len > cap) {
+        unsigned seconds = (unsigned)((cap > 44 ? cap - 44 : 0) / 32000);
+        Serial.printf("download: trimming to %u bytes (~%u s) to fit flash\n",
+                      (unsigned)cap, seconds);
+    }
+
     File out = LittleFS.open(path, FILE_WRITE);
     if (!out) {
         Serial.println("download: open failed");
@@ -1030,21 +1056,41 @@ bool ApiClient::downloadAudioToFile(const char* messageId, const char* path) {
     int lastFault = 0;
     size_t nextLog = 32768;
     const char* reason = "complete";
+    bool trimmed = false;
 
-    while (len <= 0 || received < (size_t)len) {
-        int n = stream->read(s_bodyBuf, sizeof(s_bodyBuf));
+    while (received < cap && (len <= 0 || received < (size_t)len)) {
+        size_t want = sizeof(s_bodyBuf);
+        if (want > cap - received) {
+            want = cap - received;
+        }
+        int n = stream->read(s_bodyBuf, want);
 
         if (n > 0) {
             if (out.write(s_bodyBuf, (size_t)n) != (size_t)n) {
                 reason = "fs write failed";
+                if (received >= kMinBytes) {
+                    trimmed = true;
+                }
                 break;
             }
             received += (size_t)n;
             lastData = millis();
             if (received >= nextLog) {
-                Serial.printf("download: %u/%d bytes (free=%u)\n",
-                              (unsigned)received, len, ESP.getFreeHeap());
+                size_t flashFree = storageFreeBytes();
+                Serial.printf("download: %u/%d bytes (heap=%u flash=%u)\n",
+                              (unsigned)received, len, ESP.getFreeHeap(),
+                              (unsigned)flashFree);
                 nextLog += 32768;
+                if (flashFree < kFlashMargin) {
+                    trimmed = true;
+                    reason = "trimmed";
+                    break;
+                }
+            }
+            if (received >= cap && (len <= 0 || received < (size_t)len)) {
+                trimmed = true;
+                reason = "trimmed";
+                break;
             }
             continue;
         }
@@ -1070,6 +1116,12 @@ bool ApiClient::downloadAudioToFile(const char* messageId, const char* path) {
     out.close();
     http.end();
     downloadTls.stop();
+
+    if (trimmed || (len > 0 && received < (size_t)len && received >= cap)) {
+        Serial.printf("download: saved %u of %d bytes (trimmed to fit flash)\n",
+                      (unsigned)received, len);
+        return received >= kMinBytes;
+    }
 
     if (len > 0 && received != (size_t)len) {
         Serial.printf("download: %s at %u/%d bytes (mbedtls=%d errno=%d free=%u)\n",
