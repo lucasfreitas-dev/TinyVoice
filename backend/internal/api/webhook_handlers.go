@@ -200,6 +200,7 @@ type telegramMessage struct {
 	Chat      telegramChat   `json:"chat"`
 	Voice     *telegramVoice `json:"voice"`
 	Audio     *telegramVoice `json:"audio"`
+	VideoNote *telegramVoice `json:"video_note"`
 }
 
 type telegramUpdate struct {
@@ -207,8 +208,21 @@ type telegramUpdate struct {
 	Message  *telegramMessage `json:"message"`
 }
 
+func (h *WebhookHandlers) logTelegramIgnored(reason string, attrs ...slog.Attr) {
+	if h.logger == nil {
+		return
+	}
+	args := make([]any, 0, len(attrs)+1)
+	args = append(args, slog.String("reason", reason))
+	for _, a := range attrs {
+		args = append(args, a)
+	}
+	h.logger.Info("telegram_ignored", args...)
+}
+
 func (h *WebhookHandlers) Telegram(w http.ResponseWriter, r *http.Request) {
 	if h.telegramWebhookSecret != "" && r.Header.Get("X-Telegram-Bot-Api-Secret-Token") != h.telegramWebhookSecret {
+		h.logTelegramIgnored("unauthorized")
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
@@ -226,16 +240,22 @@ func (h *WebhookHandlers) Telegram(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if update.Message == nil {
+		h.logTelegramIgnored("no_message", slog.Int64("update_id", update.UpdateID))
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 	if update.Message.From != nil && update.Message.From.IsBot {
+		h.logTelegramIgnored("from_bot", slog.Int64("chat_id", update.Message.Chat.ID))
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
 	fileID, mime, durationSec := telegramAudio(update)
 	if fileID == "" {
+		h.logTelegramIgnored("no_audio",
+			slog.Int64("chat_id", update.Message.Chat.ID),
+			slog.Int64("message_id", update.Message.MessageID),
+		)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -303,6 +323,13 @@ func telegramAudio(update telegramUpdate) (fileID, mime string, durationSec int)
 	}
 	if a := update.Message.Audio; a != nil && a.FileID != "" {
 		return a.FileID, a.MimeType, a.Duration
+	}
+	if v := update.Message.VideoNote; v != nil && v.FileID != "" {
+		mime := v.MimeType
+		if mime == "" {
+			mime = "video/mp4"
+		}
+		return v.FileID, mime, v.Duration
 	}
 	return "", "", 0
 }
@@ -458,8 +485,10 @@ func inboundExt(mime string) string {
 		return ".ogg"
 	case strings.Contains(mime, "mpeg"), strings.Contains(mime, "mp3"):
 		return ".mp3"
-	case strings.Contains(mime, "mp4"), strings.Contains(mime, "m4a"):
+	case strings.Contains(mime, "m4a"):
 		return ".m4a"
+	case strings.Contains(mime, "mp4"):
+		return ".mp4"
 	default:
 		return ".bin"
 	}

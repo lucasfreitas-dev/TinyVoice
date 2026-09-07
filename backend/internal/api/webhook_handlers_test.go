@@ -59,6 +59,18 @@ func TestTelegramAudioFallsBackToAudio(t *testing.T) {
 	}
 }
 
+func TestTelegramAudioUsesVideoNote(t *testing.T) {
+	update := telegramUpdate{
+		Message: &telegramMessage{
+			VideoNote: &telegramVoice{FileID: "vn-1", Duration: 2, MimeType: ""},
+		},
+	}
+	fileID, mime, dur := telegramAudio(update)
+	if fileID != "vn-1" || mime != "video/mp4" || dur != 2 {
+		t.Fatalf("got file=%s mime=%s dur=%d", fileID, mime, dur)
+	}
+}
+
 func TestTelegramAudioIgnoresTextOnly(t *testing.T) {
 	update := telegramUpdate{Message: &telegramMessage{}}
 	fileID, _, _ := telegramAudio(update)
