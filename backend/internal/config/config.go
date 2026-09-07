@@ -8,21 +8,23 @@ import (
 )
 
 type Config struct {
-	DatabaseURL           string
-	APIPort               string
-	AdminToken            string
-	MinIOEndpoint         string
-	MinIOAccessKey        string
-	MinIOSecretKey        string
-	MinIOBucket           string
-	MinIOUseSSL           bool
-	EvolutionBaseURL      string
-	EvolutionAPIKey       string
-	EvolutionInstance     string
+	DatabaseURL            string
+	APIPort                string
+	AdminToken             string
+	MinIOEndpoint          string
+	MinIOAccessKey         string
+	MinIOSecretKey         string
+	MinIOBucket            string
+	MinIOUseSSL            bool
+	EvolutionBaseURL       string
+	EvolutionAPIKey        string
+	EvolutionInstance      string
 	EvolutionWebhookSecret string
-	PublicURL             string
-	WorkerPollInterval    time.Duration
-	WorkerMaxAttempts     int
+	TelegramBotToken       string
+	TelegramWebhookSecret  string
+	PublicURL              string
+	WorkerPollInterval     time.Duration
+	WorkerMaxAttempts      int
 }
 
 func Load() (*Config, error) {
@@ -59,6 +61,8 @@ func Load() (*Config, error) {
 		EvolutionAPIKey:        os.Getenv("EVOLUTION_API_KEY"),
 		EvolutionInstance:      envOr("EVOLUTION_INSTANCE", "tinyvoice"),
 		EvolutionWebhookSecret: os.Getenv("EVOLUTION_WEBHOOK_SECRET"),
+		TelegramBotToken:       os.Getenv("TELEGRAM_BOT_TOKEN"),
+		TelegramWebhookSecret:  os.Getenv("TELEGRAM_WEBHOOK_SECRET"),
 		PublicURL:              envOr("TINYVOICE_PUBLIC_URL", "http://localhost:8080"),
 		WorkerPollInterval:     pollInterval,
 		WorkerMaxAttempts:      maxAttempts,

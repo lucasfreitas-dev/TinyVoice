@@ -39,7 +39,7 @@ func TestWorkerMaxAttemptsMarksFailed(t *testing.T) {
 }
 
 func TestWorkerInterval(t *testing.T) {
-	w := NewOutboundWorker(nil, nil, &mockProvider{}, 5, 100*time.Millisecond, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	w := NewOutboundWorker(nil, nil, map[string]messaging.MessagingProvider{"whatsapp": &mockProvider{}}, 5, 100*time.Millisecond, slog.New(slog.NewTextHandler(os.Stdout, nil)))
 	if w.interval != 100*time.Millisecond {
 		t.Fatal("interval not set")
 	}
@@ -48,5 +48,26 @@ func TestWorkerInterval(t *testing.T) {
 func TestMessageStatuses(t *testing.T) {
 	if message.StatusPending != "PENDING" {
 		t.Fatal("status constants mismatch")
+	}
+}
+
+func TestProviderForRoutesByChannel(t *testing.T) {
+	wa := &mockProvider{}
+	tg := &mockProvider{}
+	w := NewOutboundWorker(nil, nil, map[string]messaging.MessagingProvider{
+		"whatsapp": wa,
+		"telegram": tg,
+	}, 5, time.Second, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+
+	got, err := w.providerFor("telegram")
+	if err != nil || got != tg {
+		t.Fatalf("telegram provider mismatch: %v", err)
+	}
+	got, err = w.providerFor("whatsapp")
+	if err != nil || got != wa {
+		t.Fatalf("whatsapp provider mismatch: %v", err)
+	}
+	if _, err := w.providerFor("signal"); err == nil {
+		t.Fatal("expected missing channel error")
 	}
 }

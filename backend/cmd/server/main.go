@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,7 +17,9 @@ import (
 	"tinyvoice/backend/internal/database"
 	"tinyvoice/backend/internal/device"
 	"tinyvoice/backend/internal/message"
+	"tinyvoice/backend/internal/messaging"
 	"tinyvoice/backend/internal/messaging/evolution"
+	"tinyvoice/backend/internal/messaging/telegram"
 	"tinyvoice/backend/internal/storage"
 	"tinyvoice/backend/internal/worker"
 )
@@ -70,21 +73,44 @@ func main() {
 		evolutionClient = evolution.NewClient(cfg.EvolutionBaseURL, cfg.EvolutionAPIKey, cfg.EvolutionInstance)
 	}
 
+	var telegramClient *telegram.Client
+	if cfg.TelegramBotToken != "" {
+		telegramClient = telegram.NewClient(cfg.TelegramBotToken)
+	}
+
 	router := api.NewRouter(api.Deps{
-		Devices:         deviceSvc,
-		DeviceRepo:      deviceRepo,
-		Messages:        msgSvc,
-		Storage:         store,
-		EvolutionClient: evolutionClient,
-		Logger:          logger,
-		WebhookSecret:   cfg.EvolutionWebhookSecret,
+		Devices:               deviceSvc,
+		DeviceRepo:            deviceRepo,
+		Messages:              msgSvc,
+		Storage:               store,
+		EvolutionClient:       evolutionClient,
+		TelegramClient:        telegramClient,
+		Logger:                logger,
+		WebhookSecret:         cfg.EvolutionWebhookSecret,
+		TelegramWebhookSecret: cfg.TelegramWebhookSecret,
 	})
 
+	providers := map[string]messaging.MessagingProvider{}
 	if cfg.EvolutionAPIKey != "" {
-		provider := evolution.NewProvider(cfg.EvolutionBaseURL, cfg.EvolutionAPIKey, cfg.EvolutionInstance)
-		w := worker.NewOutboundWorker(msgSvc, store, provider, cfg.WorkerMaxAttempts, cfg.WorkerPollInterval, logger)
+		providers[conversation.ChannelWhatsApp] = evolution.NewProvider(cfg.EvolutionBaseURL, cfg.EvolutionAPIKey, cfg.EvolutionInstance)
+	}
+	if telegramClient != nil {
+		providers[conversation.ChannelTelegram] = telegram.NewProviderWithClient(telegramClient)
+		if telegramWebhookURL(cfg.PublicURL) != "" {
+			webhookURL := telegramWebhookURL(cfg.PublicURL)
+			if err := telegramClient.SetWebhook(ctx, webhookURL, cfg.TelegramWebhookSecret); err != nil {
+				logger.Error("telegram_webhook_register_failed", slog.String("error", err.Error()), slog.String("url", webhookURL))
+			} else {
+				logger.Info("telegram_webhook_registered", slog.String("url", webhookURL))
+			}
+		} else {
+			logger.Info("telegram_webhook_skipped", slog.String("reason", "TINYVOICE_PUBLIC_URL must be https (or localhost) to register a Telegram webhook"))
+		}
+	}
+	if len(providers) > 0 {
+		w := worker.NewOutboundWorker(msgSvc, store, providers, cfg.WorkerMaxAttempts, cfg.WorkerPollInterval, logger)
 		go w.Run(ctx)
-		logger.Info("worker_started")
+		logger.Info("worker_started", slog.Int("channels", len(providers)))
 	}
 
 	srv := &http.Server{
@@ -117,4 +143,15 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
 	logger.Info("server_stopped")
+}
+
+func telegramWebhookURL(publicURL string) string {
+	base := strings.TrimRight(publicURL, "/")
+	if base == "" {
+		return ""
+	}
+	if !strings.HasPrefix(base, "https://") && !strings.Contains(base, "localhost") && !strings.Contains(base, "127.0.0.1") {
+		return ""
+	}
+	return base + "/api/v1/webhooks/telegram"
 }

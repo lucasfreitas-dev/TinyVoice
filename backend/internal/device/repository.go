@@ -115,15 +115,15 @@ func (r *Repository) BindConversation(ctx context.Context, deviceID, conversatio
 	return nil
 }
 
-func (r *Repository) FindByRecipient(ctx context.Context, recipient string) (deviceID, conversationID string, err error) {
+func (r *Repository) FindByRecipient(ctx context.Context, channel, recipient string) (deviceID, conversationID string, err error) {
 	const q = `
 		SELECT dc.device_id, dc.conversation_id
 		FROM device_conversations dc
 		JOIN conversations c ON c.id = dc.conversation_id
-		WHERE c.whatsapp_recipient = $1
+		WHERE c.channel = $1 AND c.recipient = $2
 		LIMIT 1
 	`
-	err = r.pool.QueryRow(ctx, q, recipient).Scan(&deviceID, &conversationID)
+	err = r.pool.QueryRow(ctx, q, channel, recipient).Scan(&deviceID, &conversationID)
 	if err != nil {
 		return "", "", fmt.Errorf("find by recipient: %w", err)
 	}

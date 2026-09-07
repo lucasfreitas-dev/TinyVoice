@@ -9,11 +9,13 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
 
 	"tinyvoice/backend/internal/audio"
+	"tinyvoice/backend/internal/conversation"
 	"tinyvoice/backend/internal/device"
 	"tinyvoice/backend/internal/message"
 	"tinyvoice/backend/internal/storage"
@@ -23,13 +25,19 @@ type evolutionMediaClient interface {
 	GetBase64FromMediaMessage(ctx context.Context, messageID, remoteJid string) ([]byte, string, error)
 }
 
+type telegramMediaClient interface {
+	DownloadFile(ctx context.Context, fileID string) ([]byte, string, error)
+}
+
 type WebhookHandlers struct {
-	messages  *message.Service
-	devices   *device.Repository
-	storage   storage.Provider
-	evolution evolutionMediaClient
-	secret    string
-	logger    *slog.Logger
+	messages              *message.Service
+	devices               *device.Repository
+	storage               storage.Provider
+	evolution             evolutionMediaClient
+	telegram              telegramMediaClient
+	evolutionSecret       string
+	telegramWebhookSecret string
+	logger                *slog.Logger
 }
 
 func NewWebhookHandlers(
@@ -37,16 +45,20 @@ func NewWebhookHandlers(
 	devices *device.Repository,
 	storage storage.Provider,
 	evolutionClient evolutionMediaClient,
-	secret string,
+	telegramClient telegramMediaClient,
+	evolutionSecret string,
+	telegramWebhookSecret string,
 	logger *slog.Logger,
 ) *WebhookHandlers {
 	return &WebhookHandlers{
-		messages:  messages,
-		devices:   devices,
-		storage:   storage,
-		evolution: evolutionClient,
-		secret:    secret,
-		logger:    logger,
+		messages:              messages,
+		devices:               devices,
+		storage:               storage,
+		evolution:             evolutionClient,
+		telegram:              telegramClient,
+		evolutionSecret:       evolutionSecret,
+		telegramWebhookSecret: telegramWebhookSecret,
+		logger:                logger,
 	}
 }
 
@@ -74,7 +86,7 @@ type evolutionWebhook struct {
 }
 
 func (h *WebhookHandlers) Evolution(w http.ResponseWriter, r *http.Request) {
-	if h.secret != "" && r.Header.Get("apikey") != h.secret {
+	if h.evolutionSecret != "" && r.Header.Get("apikey") != h.evolutionSecret {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
@@ -124,9 +136,10 @@ func (h *WebhookHandlers) Evolution(w http.ResponseWriter, r *http.Request) {
 	}
 
 	recipient := resolveRecipient(payload.Data.Key.RemoteJid, payload.Data.Key.RemoteJidAlt, payload.Data.Key.SenderPn)
-	deviceID, convID, err := h.devices.FindByRecipient(r.Context(), recipient)
+	deviceID, convID, err := h.devices.FindByRecipient(r.Context(), conversation.ChannelWhatsApp, recipient)
 	if err != nil {
 		h.logger.Error("webhook_no_device",
+			slog.String("channel", conversation.ChannelWhatsApp),
 			slog.String("recipient", recipient),
 			slog.String("remote_jid", payload.Data.Key.RemoteJid),
 			slog.String("remote_jid_alt", payload.Data.Key.RemoteJidAlt),
@@ -147,85 +160,246 @@ func (h *WebhookHandlers) Evolution(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	durationSec := 0
+	if am := payload.Data.Message.AudioMessage; am != nil {
+		durationSec = am.Seconds
+	}
+
+	if err := h.ingestInboundAudio(r.Context(), deviceID, convID, externalID, audioData, mime, durationSec); err != nil {
+		h.writeIngestError(w, err)
+		return
+	}
+
+	h.logger.Info("message_received",
+		slog.String("channel", conversation.ChannelWhatsApp),
+		slog.String("device_id", deviceID),
+		slog.String("external_id", externalID),
+	)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+type telegramUser struct {
+	ID    int64 `json:"id"`
+	IsBot bool  `json:"is_bot"`
+}
+
+type telegramChat struct {
+	ID int64 `json:"id"`
+}
+
+type telegramVoice struct {
+	FileID   string `json:"file_id"`
+	Duration int    `json:"duration"`
+	MimeType string `json:"mime_type"`
+}
+
+type telegramMessage struct {
+	MessageID int64          `json:"message_id"`
+	From      *telegramUser  `json:"from"`
+	Chat      telegramChat   `json:"chat"`
+	Voice     *telegramVoice `json:"voice"`
+	Audio     *telegramVoice `json:"audio"`
+}
+
+type telegramUpdate struct {
+	UpdateID int64            `json:"update_id"`
+	Message  *telegramMessage `json:"message"`
+}
+
+func (h *WebhookHandlers) Telegram(w http.ResponseWriter, r *http.Request) {
+	if h.telegramWebhookSecret != "" && r.Header.Get("X-Telegram-Bot-Api-Secret-Token") != h.telegramWebhookSecret {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, `{"error":"read body"}`, http.StatusBadRequest)
+		return
+	}
+
+	var update telegramUpdate
+	if err := json.Unmarshal(body, &update); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+
+	if update.Message == nil {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if update.Message.From != nil && update.Message.From.IsBot {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	fileID, mime, durationSec := telegramAudio(update)
+	if fileID == "" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	recipient := strconv.FormatInt(update.Message.Chat.ID, 10)
+	externalID := fmt.Sprintf("%d:%d", update.Message.Chat.ID, update.Message.MessageID)
+
+	newEvent, err := h.messages.RecordWebhookEvent(r.Context(), "telegram", externalID)
+	if err != nil {
+		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		return
+	}
+	if !newEvent {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "duplicate"})
+		return
+	}
+
+	deviceID, convID, err := h.devices.FindByRecipient(r.Context(), conversation.ChannelTelegram, recipient)
+	if err != nil {
+		h.logger.Error("webhook_no_device",
+			slog.String("channel", conversation.ChannelTelegram),
+			slog.String("recipient", recipient),
+		)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if h.telegram == nil {
+		h.logger.Error("telegram_error", slog.String("error", "telegram client not configured"))
+		http.Error(w, `{"error":"telegram not configured"}`, http.StatusInternalServerError)
+		return
+	}
+
+	data, downloadedMime, err := h.telegram.DownloadFile(r.Context(), fileID)
+	if err != nil {
+		h.logger.Error("telegram_error", slog.String("error", err.Error()))
+		http.Error(w, `{"error":"download failed"}`, http.StatusInternalServerError)
+		return
+	}
+	if downloadedMime != "" {
+		mime = downloadedMime
+	}
+
+	if err := h.ingestInboundAudio(r.Context(), deviceID, convID, externalID, bytes.NewReader(data), mime, durationSec); err != nil {
+		h.writeIngestError(w, err)
+		return
+	}
+
+	h.logger.Info("message_received",
+		slog.String("channel", conversation.ChannelTelegram),
+		slog.String("device_id", deviceID),
+		slog.String("external_id", externalID),
+	)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func telegramAudio(update telegramUpdate) (fileID, mime string, durationSec int) {
+	if update.Message == nil {
+		return "", "", 0
+	}
+	if v := update.Message.Voice; v != nil && v.FileID != "" {
+		return v.FileID, v.MimeType, v.Duration
+	}
+	if a := update.Message.Audio; a != nil && a.FileID != "" {
+		return a.FileID, a.MimeType, a.Duration
+	}
+	return "", "", 0
+}
+
+func (h *WebhookHandlers) ingestInboundAudio(
+	ctx context.Context,
+	deviceID, convID, externalID string,
+	audioData io.Reader,
+	mime string,
+	durationSec int,
+) error {
 	tmpIn, err := os.CreateTemp("", "inbound-*"+inboundExt(mime))
 	if err != nil {
-		http.Error(w, `{"error":"temp file"}`, http.StatusInternalServerError)
-		return
+		return fmt.Errorf("temp file: %w", err)
 	}
 	inPath := tmpIn.Name()
 	defer os.Remove(inPath)
 	defer tmpIn.Close()
 
 	if _, err := io.Copy(tmpIn, audioData); err != nil {
-		http.Error(w, `{"error":"save failed"}`, http.StatusInternalServerError)
-		return
+		return fmt.Errorf("save failed: %w", err)
 	}
 	tmpIn.Close()
 
 	wavPath := inPath + ".wav"
 	defer os.Remove(wavPath)
 	if err := audio.ConvertToWAV(inPath, wavPath); err != nil {
-		h.logger.Error("whatsapp_error", slog.String("error", err.Error()))
-		http.Error(w, `{"error":"convert failed"}`, http.StatusInternalServerError)
-		return
+		return fmt.Errorf("convert failed: %w", err)
 	}
-	if am := payload.Data.Message.AudioMessage; am != nil && am.Seconds > audio.MaxDurationMs/1000 {
+	if durationSec > audio.MaxDurationMs/1000 {
 		h.logger.Info("inbound_audio_trimmed",
 			slog.String("external_id", externalID),
-			slog.Int("original_seconds", am.Seconds),
+			slog.Int("original_seconds", durationSec),
 			slog.Int("kept_seconds", audio.MaxDurationMs/1000),
 		)
 	}
 
 	wavFile, err := os.Open(wavPath)
 	if err != nil {
-		http.Error(w, `{"error":"open wav"}`, http.StatusInternalServerError)
-		return
+		return fmt.Errorf("open wav: %w", err)
 	}
 	defer wavFile.Close()
 
 	wavInfo, err := wavFile.Stat()
 	if err != nil {
-		http.Error(w, `{"error":"stat wav"}`, http.StatusInternalServerError)
-		return
+		return fmt.Errorf("stat wav: %w", err)
 	}
 
 	if _, err := wavFile.Seek(0, io.SeekStart); err != nil {
-		http.Error(w, `{"error":"seek wav"}`, http.StatusInternalServerError)
-		return
+		return fmt.Errorf("seek wav: %w", err)
 	}
 
 	validInfo, err := audio.ValidateWAV(wavFile, 10*1024*1024)
 	if err != nil {
-		http.Error(w, `{"error":"invalid audio"}`, http.StatusBadRequest)
-		return
+		return fmt.Errorf("invalid audio: %w", err)
 	}
 
 	if _, err := wavFile.Seek(0, io.SeekStart); err != nil {
-		http.Error(w, `{"error":"seek wav"}`, http.StatusInternalServerError)
-		return
+		return fmt.Errorf("seek wav: %w", err)
 	}
 
 	key := fmt.Sprintf("audio/inbound/%s", uuid.New().String())
-	if err := h.storage.Put(r.Context(), key, wavFile, wavInfo.Size(), "audio/wav"); err != nil {
-		h.logger.Error("storage_error", slog.String("error", err.Error()))
-		http.Error(w, `{"error":"storage failed"}`, http.StatusInternalServerError)
-		return
+	if err := h.storage.Put(ctx, key, wavFile, wavInfo.Size(), "audio/wav"); err != nil {
+		return fmt.Errorf("storage failed: %w", err)
 	}
 
-	_, err = h.messages.CreateInbound(r.Context(), deviceID, convID, externalID, key, "audio/wav", validInfo.DurationMs, wavInfo.Size())
+	_, err = h.messages.CreateInbound(ctx, deviceID, convID, externalID, key, "audio/wav", validInfo.DurationMs, wavInfo.Size())
 	if err != nil {
 		if strings.Contains(err.Error(), "duplicate") {
-			w.WriteHeader(http.StatusOK)
-			return
+			return errDuplicateInbound
 		}
-		http.Error(w, `{"error":"create message"}`, http.StatusInternalServerError)
-		return
+		return fmt.Errorf("create message: %w", err)
 	}
+	return nil
+}
 
-	h.logger.Info("message_received", slog.String("device_id", deviceID), slog.String("external_id", externalID))
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+var errDuplicateInbound = fmt.Errorf("duplicate inbound")
+
+func (h *WebhookHandlers) writeIngestError(w http.ResponseWriter, err error) {
+	switch {
+	case err == nil:
+		return
+	case strings.Contains(err.Error(), "duplicate"):
+		w.WriteHeader(http.StatusOK)
+	case strings.Contains(err.Error(), "invalid audio"):
+		h.logger.Error("inbound_invalid_audio", slog.String("error", err.Error()))
+		http.Error(w, `{"error":"invalid audio"}`, http.StatusBadRequest)
+	case strings.Contains(err.Error(), "convert failed"):
+		h.logger.Error("inbound_convert_failed", slog.String("error", err.Error()))
+		http.Error(w, `{"error":"convert failed"}`, http.StatusInternalServerError)
+	case strings.Contains(err.Error(), "storage failed"):
+		h.logger.Error("storage_error", slog.String("error", err.Error()))
+		http.Error(w, `{"error":"storage failed"}`, http.StatusInternalServerError)
+	default:
+		h.logger.Error("inbound_ingest_failed", slog.String("error", err.Error()))
+		http.Error(w, `{"error":"ingest failed"}`, http.StatusInternalServerError)
+	}
 }
 
 func normalizePhone(remoteJid string) string {
@@ -280,7 +454,7 @@ func (h *WebhookHandlers) downloadInboundAudio(ctx context.Context, payload evol
 
 func inboundExt(mime string) string {
 	switch {
-	case strings.Contains(mime, "ogg"):
+	case strings.Contains(mime, "ogg"), strings.Contains(mime, "opus"):
 		return ".ogg"
 	case strings.Contains(mime, "mpeg"), strings.Contains(mime, "mp3"):
 		return ".mp3"

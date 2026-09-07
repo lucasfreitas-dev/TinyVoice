@@ -9,11 +9,12 @@ import (
 )
 
 type Conversation struct {
-	ID                 string
-	Name               string
-	WhatsAppRecipient  string
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	ID        string
+	Name      string
+	Channel   string
+	Recipient string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 type Repository struct {
@@ -24,15 +25,15 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 	return &Repository{pool: pool}
 }
 
-func (r *Repository) Create(ctx context.Context, name, recipient string) (*Conversation, error) {
+func (r *Repository) Create(ctx context.Context, name, channel, recipient string) (*Conversation, error) {
 	const q = `
-		INSERT INTO conversations (name, whatsapp_recipient)
-		VALUES ($1, $2)
-		RETURNING id, name, whatsapp_recipient, created_at, updated_at
+		INSERT INTO conversations (name, channel, recipient)
+		VALUES ($1, $2, $3)
+		RETURNING id, name, channel, recipient, created_at, updated_at
 	`
 	var c Conversation
-	err := r.pool.QueryRow(ctx, q, name, recipient).Scan(
-		&c.ID, &c.Name, &c.WhatsAppRecipient, &c.CreatedAt, &c.UpdatedAt,
+	err := r.pool.QueryRow(ctx, q, name, channel, recipient).Scan(
+		&c.ID, &c.Name, &c.Channel, &c.Recipient, &c.CreatedAt, &c.UpdatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert conversation: %w", err)
@@ -42,12 +43,12 @@ func (r *Repository) Create(ctx context.Context, name, recipient string) (*Conve
 
 func (r *Repository) GetByID(ctx context.Context, id string) (*Conversation, error) {
 	const q = `
-		SELECT id, name, whatsapp_recipient, created_at, updated_at
+		SELECT id, name, channel, recipient, created_at, updated_at
 		FROM conversations WHERE id = $1
 	`
 	var c Conversation
 	err := r.pool.QueryRow(ctx, q, id).Scan(
-		&c.ID, &c.Name, &c.WhatsAppRecipient, &c.CreatedAt, &c.UpdatedAt,
+		&c.ID, &c.Name, &c.Channel, &c.Recipient, &c.CreatedAt, &c.UpdatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("get conversation: %w", err)
@@ -57,7 +58,7 @@ func (r *Repository) GetByID(ctx context.Context, id string) (*Conversation, err
 
 func (r *Repository) List(ctx context.Context) ([]Conversation, error) {
 	const q = `
-		SELECT id, name, whatsapp_recipient, created_at, updated_at
+		SELECT id, name, channel, recipient, created_at, updated_at
 		FROM conversations ORDER BY created_at DESC
 	`
 	rows, err := r.pool.Query(ctx, q)
@@ -69,7 +70,7 @@ func (r *Repository) List(ctx context.Context) ([]Conversation, error) {
 	var items []Conversation
 	for rows.Next() {
 		var c Conversation
-		if err := rows.Scan(&c.ID, &c.Name, &c.WhatsAppRecipient, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &c.Channel, &c.Recipient, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan conversation: %w", err)
 		}
 		items = append(items, c)

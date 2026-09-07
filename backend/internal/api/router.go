@@ -14,13 +14,15 @@ import (
 )
 
 type Deps struct {
-	Devices         *device.Service
-	DeviceRepo      *device.Repository
-	Messages        *message.Service
-	Storage         storage.Provider
-	EvolutionClient evolutionMediaClient
-	Logger          *slog.Logger
-	WebhookSecret   string
+	Devices               *device.Service
+	DeviceRepo            *device.Repository
+	Messages              *message.Service
+	Storage               storage.Provider
+	EvolutionClient       evolutionMediaClient
+	TelegramClient        telegramMediaClient
+	Logger                *slog.Logger
+	WebhookSecret         string
+	TelegramWebhookSecret string
 }
 
 func NewRouter(deps Deps) http.Handler {
@@ -33,10 +35,20 @@ func NewRouter(deps Deps) http.Handler {
 
 	deviceH := NewDeviceHandlers(deps.Devices, deps.Logger)
 	msgH := NewMessageHandlers(deps.Messages, deps.DeviceRepo, deps.Storage, deps.Logger)
-	webhookH := NewWebhookHandlers(deps.Messages, deps.DeviceRepo, deps.Storage, deps.EvolutionClient, deps.WebhookSecret, deps.Logger)
+	webhookH := NewWebhookHandlers(
+		deps.Messages,
+		deps.DeviceRepo,
+		deps.Storage,
+		deps.EvolutionClient,
+		deps.TelegramClient,
+		deps.WebhookSecret,
+		deps.TelegramWebhookSecret,
+		deps.Logger,
+	)
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Post("/webhooks/evolution", webhookH.Evolution)
+		r.Post("/webhooks/telegram", webhookH.Telegram)
 
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.DeviceAuth(deps.Devices))

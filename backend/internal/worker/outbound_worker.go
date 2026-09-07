@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -16,7 +17,7 @@ import (
 type OutboundWorker struct {
 	messages    *message.Service
 	storage     storage.Provider
-	provider    messaging.MessagingProvider
+	providers   map[string]messaging.MessagingProvider
 	maxAttempts int
 	interval    time.Duration
 	logger      *slog.Logger
@@ -25,7 +26,7 @@ type OutboundWorker struct {
 func NewOutboundWorker(
 	messages *message.Service,
 	storage storage.Provider,
-	provider messaging.MessagingProvider,
+	providers map[string]messaging.MessagingProvider,
 	maxAttempts int,
 	interval time.Duration,
 	logger *slog.Logger,
@@ -33,7 +34,7 @@ func NewOutboundWorker(
 	return &OutboundWorker{
 		messages:    messages,
 		storage:     storage,
-		provider:    provider,
+		providers:   providers,
 		maxAttempts: maxAttempts,
 		interval:    interval,
 		logger:      logger,
@@ -140,11 +141,27 @@ func (w *OutboundWorker) send(ctx context.Context, msg *message.Message) error {
 		durationSec = *msg.AudioDurationMs / 1000
 	}
 
-	return w.provider.SendAudio(ctx, conv.WhatsAppRecipient, messaging.AudioMessage{
+	provider, err := w.providerFor(conv.Channel)
+	if err != nil {
+		return err
+	}
+
+	return provider.SendAudio(ctx, conv.Recipient, messaging.AudioMessage{
 		Reader:      opusFile,
 		Size:        opusInfo.Size(),
 		MimeType:    "audio/ogg",
 		DurationSec: durationSec,
 		FileName:    "voice.opus",
 	})
+}
+
+func (w *OutboundWorker) providerFor(channel string) (messaging.MessagingProvider, error) {
+	if w.providers == nil {
+		return nil, fmt.Errorf("no messaging provider for channel %s", channel)
+	}
+	provider, ok := w.providers[channel]
+	if !ok || provider == nil {
+		return nil, fmt.Errorf("no messaging provider for channel %s", channel)
+	}
+	return provider, nil
 }

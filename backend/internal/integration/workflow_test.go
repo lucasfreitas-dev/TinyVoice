@@ -75,7 +75,7 @@ func TestUploadToWorkerFlowConcept(t *testing.T) {
 	store := newMemStorage()
 	provider := &mockMessaging{}
 
-	w := worker.NewOutboundWorker(nil, store, provider, 3, time.Second, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	w := worker.NewOutboundWorker(nil, store, map[string]messaging.MessagingProvider{"whatsapp": provider}, 3, time.Second, slog.New(slog.NewTextHandler(os.Stdout, nil)))
 	if w == nil {
 		t.Fatal("worker nil")
 	}

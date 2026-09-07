@@ -143,7 +143,7 @@ func conversationCmd() *cobra.Command {
 }
 
 func conversationCreateCmd() *cobra.Command {
-	var name, recipient string
+	var name, channel, recipient string
 	cmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create a conversation",
@@ -166,16 +166,17 @@ func conversationCreateCmd() *cobra.Command {
 			defer pool.Close()
 
 			svc := conversation.NewService(conversation.NewRepository(pool))
-			c, err := svc.Create(ctx, name, recipient)
+			c, err := svc.Create(ctx, name, channel, recipient)
 			if err != nil {
 				return err
 			}
-			fmt.Printf("Conversation created\n  ID:        %s\n  Name:      %s\n  Recipient: %s\n", c.ID, c.Name, c.WhatsAppRecipient)
+			fmt.Printf("Conversation created\n  ID:        %s\n  Name:      %s\n  Channel:   %s\n  Recipient: %s\n", c.ID, c.Name, c.Channel, c.Recipient)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "Conversation name")
-	cmd.Flags().StringVar(&recipient, "recipient", "", "WhatsApp recipient number e.g. 5511000000001")
+	cmd.Flags().StringVar(&channel, "channel", conversation.ChannelWhatsApp, "Messaging channel: whatsapp or telegram")
+	cmd.Flags().StringVar(&recipient, "recipient", "", "WhatsApp number (e.g. 5511000000001) or Telegram chat id")
 	return cmd
 }
 
@@ -203,9 +204,9 @@ func conversationListCmd() *cobra.Command {
 				return err
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "ID\tNAME\tRECIPIENT")
+			fmt.Fprintln(w, "ID\tNAME\tCHANNEL\tRECIPIENT")
 			for _, c := range items {
-				fmt.Fprintf(w, "%s\t%s\t%s\n", c.ID, c.Name, c.WhatsAppRecipient)
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", c.ID, c.Name, c.Channel, c.Recipient)
 			}
 			return w.Flush()
 		},

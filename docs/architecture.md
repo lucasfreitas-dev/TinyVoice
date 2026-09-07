@@ -2,7 +2,7 @@
 
 ## Overview
 
-TinyVoice connects a child-friendly physical device to WhatsApp through a self-hosted backend.
+TinyVoice connects a child-friendly physical device to WhatsApp or Telegram through a self-hosted backend.
 
 ```
 ESP32 (TinyVoice)
@@ -14,6 +14,7 @@ TinyVoice API (Go)
     ├── PostgreSQL (devices, messages, queue)
     ├── MinIO (audio files)
     └── Worker → Evolution API → WhatsApp
+             └── Telegram Bot API → Telegram
 ```
 
 ## Components
@@ -39,10 +40,11 @@ REST API under `/api/v1`:
 | `GET /api/v1/device/messages/{id}/audio` | device | Download audio |
 | `POST /api/v1/device/messages/{id}/played` | device | Mark played |
 | `POST /api/v1/webhooks/evolution` | apikey | Receive WhatsApp audio |
+| `POST /api/v1/webhooks/telegram` | `X-Telegram-Bot-Api-Secret-Token` | Receive Telegram voice/audio |
 
 ### Worker
 
-Polls PostgreSQL for `PENDING` outbound messages using `FOR UPDATE SKIP LOCKED`. Converts WAV to Opus via FFmpeg, sends through Evolution API, updates status to `SENT` or `FAILED` with exponential backoff retry.
+Polls PostgreSQL for `PENDING` outbound messages using `FOR UPDATE SKIP LOCKED`. Converts WAV to Opus via FFmpeg, then sends through the conversation's channel provider (Evolution for WhatsApp, Telegram Bot API for Telegram). Updates status to `SENT` or `FAILED` with exponential backoff retry.
 
 ### Storage
 
@@ -61,12 +63,12 @@ Files are streamed — never loaded fully into memory for HTTP responses.
 
 1. ESP uploads WAV multipart
 2. API validates, stores in MinIO, creates message `PENDING`
-3. Worker converts to Opus, sends via Evolution
+3. Worker converts to Opus, sends via the conversation channel (WhatsApp or Telegram)
 4. Status → `SENT`
 
 ### Inbound (parent → child)
 
-1. Evolution webhook `MESSAGES_UPSERT` with audio
+1. Channel webhook (Evolution `MESSAGES_UPSERT` or Telegram `message.voice` / `message.audio`)
 2. API downloads media, converts to WAV, stores in MinIO
 3. Message status → `AVAILABLE`
 4. ESP polls, LED green
@@ -76,7 +78,8 @@ Files are streamed — never loaded fully into memory for HTTP responses.
 ## Security
 
 - Device tokens stored as bcrypt hashes only
-- Webhook protected by Evolution API key header
+- WhatsApp webhook protected by Evolution API key header
+- Telegram webhook protected by `X-Telegram-Bot-Api-Secret-Token`
 - Admin CLI requires `ADMIN_TOKEN`
 - No secrets in structured logs
 

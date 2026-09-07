@@ -31,6 +31,7 @@ Replace `tinyvoice.example.com` and `your-vps-ip` with your values throughout th
 | Domain | `tinyvoice.example.com` |
 | DNS | `A` record `tinyvoice` → VPS public IP |
 | WhatsApp | Dedicated number (do not use your personal account) |
+| Telegram | Bot token from [@BotFather](https://t.me/BotFather) (optional, in addition to or instead of WhatsApp) |
 
 Verify DNS before continuing:
 
@@ -110,6 +111,9 @@ EVOLUTION_PUBLIC_URL=https://tinyvoice.example.com
 EVOLUTION_INSTANCE=tinyvoice
 # POSTGRES_PASSWORD, MINIO_ROOT_PASSWORD, ADMIN_TOKEN,
 # EVOLUTION_API_KEY, EVOLUTION_WEBHOOK_SECRET — unique random values
+# Optional Telegram:
+# TELEGRAM_BOT_TOKEN=123456:ABC...
+# TELEGRAM_WEBHOOK_SECRET=<openssl rand -hex 32>
 ```
 
 ### 6. Configure Caddy (HTTPS)
@@ -205,7 +209,10 @@ docker compose --env-file ../.env exec tinyvoice-api \
   tinyvoice device create --name "My Box"
 
 docker compose --env-file ../.env exec tinyvoice-api \
-  tinyvoice conversation create --name "Family" --recipient "5511000000001"
+  tinyvoice conversation create --name "Family" --channel whatsapp --recipient "5511000000001"
+
+# Or Telegram (recipient is the parent's chat id):
+# tinyvoice conversation create --name "Family" --channel telegram --recipient "123456789"
 
 docker compose --env-file ../.env exec tinyvoice-api \
   tinyvoice device bind --device <device-id> --conversation <conversation-id>
@@ -238,13 +245,20 @@ pio run -t upload
 
 ### 12. End-to-end test
 
-1. ESP records and uploads → parent receives WhatsApp voice note
+1. ESP records and uploads → parent receives a voice note on WhatsApp or Telegram
 2. Parent replies with audio → webhook fires → ESP LED turns green
 3. Monitor logs:
 
 ```bash
-docker compose --env-file ../.env logs -f tinyvoice-api | grep -E "message_received|webhook|whatsapp"
+docker compose --env-file ../.env logs -f tinyvoice-api | grep -E "message_received|webhook|whatsapp|telegram"
 ```
+
+### Telegram setup
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) and set `TELEGRAM_BOT_TOKEN`.
+2. Set `TELEGRAM_WEBHOOK_SECRET` to a random hex string.
+3. `TINYVOICE_PUBLIC_URL` must be HTTPS so Telegram can reach `/api/v1/webhooks/telegram`. The API registers the webhook on startup.
+4. Ask the parent to send `/start` (or any message) to the bot, then look up their chat id (`@userinfobot` or API logs) and create a conversation with `--channel telegram --recipient <chat_id>`.
 
 ---
 

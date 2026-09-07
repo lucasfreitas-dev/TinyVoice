@@ -86,7 +86,7 @@ Response:
 {"status": "played"}
 ```
 
-## Evolution Webhook
+## Evolution Webhook (WhatsApp)
 
 ```
 POST /api/v1/webhooks/evolution
@@ -96,3 +96,14 @@ apikey: <EVOLUTION_WEBHOOK_SECRET or EVOLUTION_API_KEY>
 Configure Evolution instance webhook for `MESSAGES_UPSERT` pointing to this URL.
 
 Only inbound audio messages are processed. Duplicate events are ignored via idempotency table.
+
+## Telegram Webhook
+
+```
+POST /api/v1/webhooks/telegram
+X-Telegram-Bot-Api-Secret-Token: <TELEGRAM_WEBHOOK_SECRET>
+```
+
+Telegram Bot API updates. Only `message.voice` and `message.audio` are processed. The conversation recipient must be the Telegram chat id (numeric string).
+
+If `TELEGRAM_BOT_TOKEN` is set and `TINYVOICE_PUBLIC_URL` is HTTPS (or localhost), the API registers this webhook on startup.

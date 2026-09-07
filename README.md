@@ -1,12 +1,13 @@
 # TinyVoice
 
-TinyVoice is a physical audio messaging box based on ESP32. A child holds a button to record a voice message; the message is sent via Wi-Fi to a home-server backend and delivered to a parent through WhatsApp. When the parent replies with audio, an LED indicates a new message and the child presses the button to listen.
+TinyVoice is a physical audio messaging box based on ESP32. A child holds a button to record a voice message; the message is sent via Wi-Fi to a home-server backend and delivered to a parent through WhatsApp or Telegram. When the parent replies with audio, an LED indicates a new message and the child presses the button to listen.
 
 ## Architecture
 
 - **ESP32 firmware** — INMP441 microphone, MAX98357A amplifier, button, LED, optional volume pot
 - **Go API** — REST backend with PostgreSQL and MinIO
 - **Evolution API** — WhatsApp integration
+- **Telegram Bot API** — optional Telegram integration
 - **Docker Compose** — home server stack with Caddy reverse proxy
 
 See [docs/architecture.md](docs/architecture.md) for details.
@@ -50,7 +51,8 @@ export DATABASE_URL=postgres://tinyvoice:change-me-postgres@localhost:5432/tinyv
 
 # Build CLI locally or use docker exec:
 cd backend && go run ./cmd/tinyvoice device create --name "My Box"
-cd backend && go run ./cmd/tinyvoice conversation create --name "Family" --recipient "5511000000001"
+cd backend && go run ./cmd/tinyvoice conversation create --name "Family" --channel whatsapp --recipient "5511000000001"
+# or: --channel telegram --recipient "123456789"
 cd backend && go run ./cmd/tinyvoice device bind --device <device-id> --conversation <conversation-id>
 ```
 
@@ -71,7 +73,7 @@ See [docs/hardware.md](docs/hardware.md) for wiring.
 
 1. Power on TinyVoice — LED connects (yellow), then idle (off)
 2. Hold the button — LED blue, speak, release — message uploads
-3. Parent receives WhatsApp voice note
+3. Parent receives a WhatsApp or Telegram voice note
 4. Parent replies with audio
 5. TinyVoice LED turns green
 6. Press button briefly — audio plays
