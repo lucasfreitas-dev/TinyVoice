@@ -564,6 +564,8 @@ bool AudioRecorder::start() {
     s_recorderInstance = this;
 
     // Capture keeps filling the ring through this blocking setup so speech is not lost.
+    // Keep this setup short: capture is already filling the 1 s ring, so a
+    // multi-second walk of LittleFS here drops the pre-roll again.
     storagePruneForRecording();
     cleanupRecording();
     storageReclaimForTake();

@@ -552,9 +552,10 @@ void loop() {
         }
     }
 
-    // Button: hold to record (only when no pending message to play)
+    // Button: hold to record (only when no pending message to play).
+    // Do not waitForNetIdle here: the ring is only 1 s, and a blocking poll
+    // wait wraps it, which is what clipped the first words of the take.
     if (button.wasJustHeld() && canArmRecord) {
-        waitForNetIdle(10000);
         stateMachine.onButtonHoldStart();
         if (stateMachine.current() == DeviceState::RECORDING) {
             if (!audioRecorder.start()) {
