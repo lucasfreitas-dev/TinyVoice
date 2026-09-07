@@ -2,10 +2,12 @@
 # Usage:
 #   docker compose --env-file ../.env -f docker-compose.yml -f docker-compose.prod.yml up -d
 #
-# Postgres is published on loopback only so DBeaver can SSH-tunnel to it.
-# Do not change this to 0.0.0.0 / "5432:5432".
+# Compose concatenates `ports` across files unless !override is set.
+# Base docker-compose.yml publishes 5432:5432 (0.0.0.0). Without !override,
+# prod would add a second bind on 127.0.0.1:5432 and Docker fails with
+# "address already in use" even though ss showed the port free before `up`.
 
 services:
   postgres:
-    ports:
+    ports: !override
       - "127.0.0.1:5432:5432"
