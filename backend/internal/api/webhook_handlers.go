@@ -244,11 +244,6 @@ func (h *WebhookHandlers) Telegram(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	if update.Message.From != nil && update.Message.From.IsBot {
-		h.logTelegramIgnored("from_bot", slog.Int64("chat_id", update.Message.Chat.ID))
-		w.WriteHeader(http.StatusOK)
-		return
-	}
 
 	fileID, mime, durationSec := telegramAudio(update)
 	if fileID == "" {
