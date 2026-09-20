@@ -113,20 +113,35 @@ ApiEndpoint parseEndpoint(const char* path) {
     return ep;
 }
 
+void prepareTlsClient(WiFiClientSecure& tls) {
+    tls.setInsecure();
+    // Seconds. Must be set before connect(); start_ssl_client copies this
+    // into the handshake deadline. The old 5 s default is why heartbeat/poll
+    // printed -1 / -11 on a slow AP even though the API was up.
+    tls.setTimeout(30);
+    tls.setHandshakeTimeout(20);
+}
+
+void finishTls(HTTPClient& http, WiFiClientSecure& tls) {
+    http.end();
+    tls.stop();
+    delay(150);
+}
+
 void configureHttp(HTTPClient& http) {
-    http.setConnectTimeout(3000);
-    http.setTimeout(8000);
+    http.setConnectTimeout(15000);
+    http.setTimeout(20000);
     http.setReuse(false);
 }
 
 void configureHttpDownload(HTTPClient& http) {
-    http.setConnectTimeout(5000);
+    http.setConnectTimeout(15000);
     http.setTimeout(30000);
     http.setReuse(false);
 }
 
 void configureHttpUpload(HTTPClient& http) {
-    http.setConnectTimeout(5000);
+    http.setConnectTimeout(15000);
     http.setTimeout(API_TIMEOUT_MS);
     http.setReuse(false);
 }
@@ -824,7 +839,7 @@ bool ApiClient::heartbeat() {
     delay(50);
 
     WiFiClientSecure tls;
-    tls.setInsecure();
+    prepareTlsClient(tls);
 
     HTTPClient http;
     ApiEndpoint ep = parseEndpoint("/api/v1/device/heartbeat");
@@ -837,8 +852,7 @@ bool ApiClient::heartbeat() {
     setAuth(http);
     int code = http.POST("");
     logHttpResult("heartbeat", code);
-    http.end();
-    tls.stop();
+    finishTls(http, tls);
     return code == 200;
 }
 
@@ -851,7 +865,7 @@ bool ApiClient::pollNext(NextMessage& out) {
     delay(50);
 
     WiFiClientSecure tls;
-    tls.setInsecure();
+    prepareTlsClient(tls);
 
     HTTPClient http;
     ApiEndpoint ep = parseEndpoint("/api/v1/device/messages/next");
@@ -865,14 +879,12 @@ bool ApiClient::pollNext(NextMessage& out) {
 
     if (code != 200) {
         logHttpResult("poll", code);
-        http.end();
-        tls.stop();
+        finishTls(http, tls);
         return false;
     }
 
     String body = http.getString();
-    http.end();
-    tls.stop();
+    finishTls(http, tls);
 
     JsonDocument doc;
     if (deserializeJson(doc, body)) return false;
@@ -989,7 +1001,7 @@ bool ApiClient::downloadAudioToFile(const char* messageId, const char* path, boo
                   ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
     WiFiClientSecure downloadTls;
-    downloadTls.setInsecure();
+    prepareTlsClient(downloadTls);
 
     HTTPClient http;
     String apiPath = String("/api/v1/device/messages/") + messageId + "/audio";
@@ -1108,7 +1120,7 @@ bool ApiClient::downloadAudioToFile(const char* messageId, const char* path, boo
             reason = "peer closed";
             break;
         }
-        if (millis() - lastData > 15000) {
+        if (millis() - lastData > 25000) {
             reason = "stalled";
             break;
         }
@@ -1149,7 +1161,7 @@ bool ApiClient::markPlayed(const char* messageId) {
     delay(200);
 
     WiFiClientSecure tls;
-    tls.setInsecure();
+    prepareTlsClient(tls);
 
     HTTPClient http;
     String path = String("/api/v1/device/messages/") + messageId + "/played";
@@ -1163,7 +1175,6 @@ bool ApiClient::markPlayed(const char* messageId) {
     setAuth(http);
     int code = http.POST("");
     logHttpResult("played", code);
-    http.end();
-    tls.stop();
+    finishTls(http, tls);
     return code == 200;
 }

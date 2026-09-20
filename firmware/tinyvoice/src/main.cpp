@@ -24,6 +24,8 @@ Led led;
 unsigned long lastPollMs = 0;
 unsigned long lastHeartbeatMs = 0;
 char pendingMessageId[40] = {0};
+char announcedMessageId[40] = {0};
+char playedMessageId[40] = {0};
 
 // Local upload queue (simple filesystem queue)
 const char* QUEUE_DIR = "/queue";
@@ -49,10 +51,12 @@ static void noteApiSuccess() {
 
 static void noteApiFailure() {
     s_apiFailStreak++;
-    if (s_apiFailStreak >= 3) {
-        s_apiBackoffUntil = millis() + 60000;
+    // Transient TLS aborts are common on this radio; a 60s blackout after 3
+    // misses left the box mute while the API was still up.
+    if (s_apiFailStreak >= 6) {
+        s_apiBackoffUntil = millis() + 15000;
         s_apiFailStreak = 0;
-        Serial.println("api: unreachable, backing off 60s");
+        Serial.println("api: tls failing, backing off 15s");
     }
 }
 
@@ -67,7 +71,7 @@ static void requestUpload(const uint8_t* wavHeader, size_t pcmBytes, int chunkCo
     s_uploadRequested = true;
 }
 
-enum class NetJob : uint8_t { NONE, POLL, DOWNLOAD, MARK_PLAYED };
+enum class NetJob : uint8_t { NONE, POLL, DOWNLOAD, MARK_PLAYED, HEARTBEAT };
 
 // A single long-lived worker owns every background TLS call. Creating a task per poll or
 // per download meant a tight heap could refuse the allocation, which is what left inbound
@@ -101,6 +105,10 @@ static void uploadProgressTick() {
 
 static void runUploadJob() {
     waitForNetIdle(30000);
+    while (!apiCallsAllowed()) {
+        led.loop();
+        delay(50);
+    }
 
     Serial.printf("upload: starting (%u pcm bytes, %d chunks)\n",
                   (unsigned)s_uploadJob.pcmBytes, s_uploadJob.chunkCount);
@@ -298,7 +306,7 @@ void setup() {
 }
 
 bool uploadPendingRecording() {
-    if (millis() < s_uploadRetryAfter) {
+    if (!apiCallsAllowed() || millis() < s_uploadRetryAfter) {
         return false;
     }
     if (s_uploadRequested) {
@@ -369,6 +377,8 @@ static char s_downloadMessageId[40] = {0};
 static volatile bool s_pollTaskDone = false;
 static bool s_pollOk = false;
 static NextMessage s_pollMsg = {};
+static volatile bool s_heartbeatTaskDone = false;
+static bool s_heartbeatOk = false;
 
 static void runDownloadJob() {
     Serial.println("download: started");
@@ -407,9 +417,13 @@ static void netTaskEntry(void* arg) {
         if (job == NetJob::POLL) {
             s_pollOk = apiClient.pollNext(s_pollMsg);
             s_pollTaskDone = true;
+        } else if (job == NetJob::HEARTBEAT) {
+            s_heartbeatOk = apiClient.heartbeat();
+            s_heartbeatTaskDone = true;
         } else if (job == NetJob::MARK_PLAYED) {
-            apiClient.markPlayed(s_downloadMessageId);
-            s_downloadMessageId[0] = '\0';
+            if (apiClient.markPlayed(s_downloadMessageId)) {
+                s_downloadMessageId[0] = '\0';
+            }
         } else {
             runDownloadJob();
         }
@@ -454,6 +468,9 @@ static void handleInboundPlayback() {
 
     if (!audioPlayer.playFile(INBOUND_PLAY_PATH)) {
         Serial.println("audio: playback failed");
+    } else if (s_downloadMessageId[0] != '\0') {
+        strlcpy(playedMessageId, s_downloadMessageId, sizeof(playedMessageId));
+        strlcpy(announcedMessageId, s_downloadMessageId, sizeof(announcedMessageId));
     }
     LittleFS.remove(INBOUND_PLAY_PATH);
     pendingMessageId[0] = '\0';
@@ -545,13 +562,21 @@ void loop() {
         audioRecorder.disarm();
     }
 
-    // Button: short press to play pending message (quick tap < HOLD_THRESHOLD_MS)
-    if (button.wasShortPress() && stateMachine.hasPendingMessage()) {
-        Serial.println("button: play requested");
-        stateMachine.onButtonShortPress();
-        if (stateMachine.current() == DeviceState::DOWNLOADING) {
-            handleDownloadAndPlay();
-            led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+    // Pending inbound: tap or hold plays. A hold must not record instead.
+    if (stateMachine.hasPendingMessage() &&
+        (button.wasShortPress() || button.wasJustHeld())) {
+        DeviceState playState = stateMachine.current();
+        if (playState == DeviceState::DOWNLOADING ||
+            playState == DeviceState::PLAYING ||
+            s_inboundReady) {
+            Serial.println("button: play ignored, already playing");
+        } else {
+            Serial.println("button: play requested");
+            stateMachine.onButtonShortPress();
+            if (stateMachine.current() == DeviceState::DOWNLOADING) {
+                handleDownloadAndPlay();
+                led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+            }
         }
     }
 
@@ -593,18 +618,32 @@ void loop() {
         if (s_pollOk) {
             noteApiSuccess();
             if (s_pollMsg.available) {
-                bool isNew = pendingMessageId[0] == '\0' ||
-                             strcmp(pendingMessageId, s_pollMsg.id) != 0;
-                strlcpy(pendingMessageId, s_pollMsg.id, sizeof(pendingMessageId));
-                Serial.printf("poll: message available id=%s\n", pendingMessageId);
-                if (isNew) {
-                    audioPlayer.playRingtone();
+                if (playedMessageId[0] != '\0' &&
+                    strcmp(playedMessageId, s_pollMsg.id) == 0) {
+                    Serial.printf("poll: already played id=%s, retrying ack\n",
+                                  s_pollMsg.id);
+                    if (s_downloadMessageId[0] == '\0') {
+                        strlcpy(s_downloadMessageId, s_pollMsg.id, sizeof(s_downloadMessageId));
+                    }
+                    requestNetJob(NetJob::MARK_PLAYED);
+                    stateMachine.onPollComplete(false);
+                } else {
+                    bool isNew = strcmp(announcedMessageId, s_pollMsg.id) != 0;
+                    strlcpy(pendingMessageId, s_pollMsg.id, sizeof(pendingMessageId));
+                    Serial.printf("poll: message available id=%s\n", pendingMessageId);
+                    if (isNew) {
+                        strlcpy(announcedMessageId, s_pollMsg.id, sizeof(announcedMessageId));
+                        audioPlayer.playRingtone();
+                    } else {
+                        Serial.printf("poll: still waiting to play id=%s\n", pendingMessageId);
+                    }
+                    stateMachine.onPollComplete(true);
                 }
             } else {
                 Serial.printf("poll: no message (free=%u max=%u)\n",
                               ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+                stateMachine.onPollComplete(false);
             }
-            stateMachine.onPollComplete(s_pollMsg.available);
         } else {
             noteApiFailure();
             stateMachine.onPollComplete(stateMachine.hasPendingMessage());
@@ -612,7 +651,16 @@ void loop() {
         led.update(stateMachine.current(), stateMachine.hasPendingMessage());
     }
 
-    // Heartbeat every 60s (skip while the worker holds a TLS session)
+    if (s_heartbeatTaskDone) {
+        s_heartbeatTaskDone = false;
+        if (s_heartbeatOk) {
+            noteApiSuccess();
+        } else {
+            noteApiFailure();
+        }
+    }
+
+    // Heartbeat every 60s — same worker as poll so TLS never overlaps.
     if (apiCallsAllowed() &&
         wifiManager.isConnected() &&
         stateMachine.current() != DeviceState::UPLOADING &&
@@ -624,11 +672,8 @@ void loop() {
         !s_netBusy &&
         millis() - lastHeartbeatMs > 60000) {
         lastHeartbeatMs = millis();
-        if (apiClient.heartbeat()) {
-            noteApiSuccess();
-        } else {
-            noteApiFailure();
-        }
+        s_heartbeatTaskDone = false;
+        requestNetJob(NetJob::HEARTBEAT);
     }
 
     // Poll for messages in background so button stays responsive
