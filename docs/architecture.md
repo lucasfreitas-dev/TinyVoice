@@ -25,6 +25,8 @@ TinyVoice API (Go)
 - Records mono 16 kHz WAV via INMP441 (I2S)
 - Plays WAV via MAX98357A (I2S)
 - Polls `GET /api/v1/device/messages/next` every 5 seconds
+- Heartbeat reports firmware version and flushes a small remote-log ring buffer
+- HTTP OTA when the API assigns a different firmware version (dual app slots on the default 4 MB partition)
 - Local LittleFS queue for offline uploads
 
 ### TinyVoice API
@@ -34,7 +36,9 @@ REST API under `/api/v1`:
 | Endpoint | Auth | Purpose |
 |----------|------|---------|
 | `GET /health` | none | Health check |
-| `POST /api/v1/device/heartbeat` | device | Update last seen |
+| `POST /api/v1/device/heartbeat` | device | Update last seen, report version, receive OTA offer |
+| `POST /api/v1/device/logs` | device | Flush remote logs |
+| `GET /api/v1/device/firmware/binary` | device | Download assigned firmware |
 | `POST /api/v1/device/messages` | device | Upload audio |
 | `GET /api/v1/device/messages/next` | device | Poll for messages |
 | `GET /api/v1/device/messages/{id}/audio` | device | Download audio |
@@ -53,6 +57,7 @@ MinIO bucket `tinyvoice-audio`:
 ```
 audio/outbound/{uuid}
 audio/inbound/{uuid}
+firmware/{version}.bin
 ```
 
 Files are streamed — never loaded fully into memory for HTTP responses.
@@ -90,5 +95,7 @@ Prepared but not implemented in MVP:
 - Captive portal Wi-Fi setup
 - Battery / presence sensor / display
 - WebSocket push (polling is sufficient for MVP)
+
+Remote logs and HTTP OTA are implemented: devices ship logs with heartbeat (or `POST /device/logs`), and apply an assigned firmware from `GET /device/firmware/binary`.
 
 Volume pot on GPIO 34 is implemented: ADC reading scales PCM playback, and the minimum gain is never mute.

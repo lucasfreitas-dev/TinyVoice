@@ -10,6 +10,7 @@ enum class DeviceState {
     CHECKING_MESSAGES,
     DOWNLOADING,
     PLAYING,
+    UPDATING,
     ERROR
 };
 
@@ -37,6 +38,8 @@ public:
     void onDownloadFailed();
     void onPlaybackComplete();
     void onRecordingCancelled();
+    void onUpdateStart();
+    void onUpdateFailed();
     void onError(const char* reason);
 
     const char* lastError() const;

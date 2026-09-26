@@ -25,12 +25,91 @@ Authorization: Bearer <device_token>
 
 ```
 POST /api/v1/device/heartbeat
+Content-Type: application/json
+```
+
+Body is optional. Empty body still updates last-seen (older firmware).
+
+```json
+{
+  "firmware_version": "0.1.0",
+  "uptime_ms": 125000,
+  "free_heap": 81234,
+  "rssi": -58,
+  "logs": [
+    {"ts_ms": 1200, "level": "info", "msg": "wifi: connected"}
+  ]
+}
 ```
 
 Response:
 ```json
-{"status": "ok"}
+{
+  "status": "ok",
+  "firmware": {
+    "update_available": false
+  }
+}
 ```
+
+When an admin has assigned a different firmware version to the device:
+
+```json
+{
+  "status": "ok",
+  "firmware": {
+    "update_available": true,
+    "version": "0.2.0",
+    "size_bytes": 987654,
+    "sha256": "…"
+  },
+  "logs": {"accepted": 1}
+}
+```
+
+## Remote Logs
+
+```
+POST /api/v1/device/logs
+Content-Type: application/json
+```
+
+Used when the on-device ring buffer is nearly full between heartbeats.
+
+```json
+{
+  "firmware_version": "0.1.0",
+  "uptime_ms": 125000,
+  "entries": [
+    {"ts_ms": 1200, "level": "error", "msg": "upload: failed"}
+  ]
+}
+```
+
+Response:
+```json
+{"status": "ok", "accepted": 1}
+```
+
+At most 50 entries per request. Each message is truncated to 256 characters. The API keeps the last 1000 lines per device.
+
+## Firmware Download
+
+```
+GET /api/v1/device/firmware/binary
+```
+
+Streams the firmware binary currently assigned to this device (`application/octet-stream`).
+
+Headers:
+
+```
+Content-Length: 987654
+X-Firmware-Version: 0.2.0
+X-Firmware-SHA256: …
+```
+
+`404` if no firmware is assigned. The device only downloads when heartbeat reports `update_available`.
 
 ## Upload Message
 

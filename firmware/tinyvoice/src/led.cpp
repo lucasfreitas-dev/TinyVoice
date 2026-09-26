@@ -92,6 +92,7 @@ bool Led::wifiPatternActive() const {
         case DeviceState::UPLOADING:
         case DeviceState::PLAYING:
         case DeviceState::DOWNLOADING:
+        case DeviceState::UPDATING:
             return false;
         default:
             return true;
@@ -114,6 +115,8 @@ unsigned Led::pulseStepMs() const {
             return _blinkOn ? UPLOAD_ON_MS[_pulsePhase % 3] : PULSE_OFF_MS;
         case DeviceState::DOWNLOADING:
             return _blinkOn ? DOWNLOAD_ON_MS[_pulsePhase % 3] : PULSE_OFF_MS;
+        case DeviceState::UPDATING:
+            return _blinkOn ? 400 : 200;
         case DeviceState::PLAYING:
             return _trimHint ? TRIM_BLINK_MS : 0;
         default:
@@ -176,6 +179,12 @@ void Led::applyOutputs() {
             if (_blinkOn) {
                 writeGreen(255);
                 writeRgb(false, true);
+            }
+            break;
+        case DeviceState::UPDATING:
+            if (_blinkOn) {
+                writeGreen(255);
+                writeRgb(true, false);
             }
             break;
         case DeviceState::PLAYING:

@@ -50,3 +50,25 @@ func (s *Service) UpdateLastSeen(ctx context.Context, id string) error {
 func (s *Service) GetConversationID(ctx context.Context, deviceID string) (string, error) {
 	return s.repo.GetConversationID(ctx, deviceID)
 }
+
+func (s *Service) RecordHeartbeat(ctx context.Context, id string, runtime RuntimeUpdate) error {
+	if err := s.repo.UpdateLastSeen(ctx, id); err != nil {
+		return err
+	}
+	return s.repo.UpsertRuntime(ctx, id, runtime)
+}
+
+func (s *Service) InsertLogs(ctx context.Context, deviceID, firmwareVersion string, entries []LogIn) (int, error) {
+	normalized, err := NormalizeLogs(entries)
+	if err != nil {
+		return 0, err
+	}
+	if err := s.repo.InsertLogs(ctx, deviceID, firmwareVersion, normalized); err != nil {
+		return 0, err
+	}
+	return len(normalized), nil
+}
+
+func (s *Service) ListLogs(ctx context.Context, deviceID string, limit int) ([]LogEntry, error) {
+	return s.repo.ListLogs(ctx, deviceID, limit)
+}

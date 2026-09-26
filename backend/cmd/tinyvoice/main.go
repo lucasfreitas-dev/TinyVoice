@@ -12,6 +12,8 @@ import (
 	"tinyvoice/backend/internal/conversation"
 	"tinyvoice/backend/internal/database"
 	"tinyvoice/backend/internal/device"
+	"tinyvoice/backend/internal/firmware"
+	"tinyvoice/backend/internal/storage"
 )
 
 func main() {
@@ -25,13 +27,13 @@ func rootCmd() *cobra.Command {
 		Use:   "tinyvoice",
 		Short: "TinyVoice administration CLI",
 	}
-	cmd.AddCommand(deviceCmd(), conversationCmd())
+	cmd.AddCommand(deviceCmd(), conversationCmd(), firmwareCmd())
 	return cmd
 }
 
 func deviceCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "device", Short: "Manage devices"}
-	cmd.AddCommand(deviceCreateCmd(), deviceListCmd(), deviceBindCmd())
+	cmd.AddCommand(deviceCreateCmd(), deviceListCmd(), deviceBindCmd(), deviceLogsCmd())
 	return cmd
 }
 
@@ -92,13 +94,17 @@ func deviceListCmd() *cobra.Command {
 			}
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "ID\tNAME\tENABLED\tLAST SEEN")
+			fmt.Fprintln(w, "ID\tNAME\tENABLED\tFIRMWARE\tLAST SEEN")
 			for _, d := range devices {
 				lastSeen := "-"
 				if d.LastSeenAt != nil {
 					lastSeen = d.LastSeenAt.Format("2006-01-02 15:04:05")
 				}
-				fmt.Fprintf(w, "%s\t%s\t%v\t%s\n", d.ID, d.Name, d.Enabled, lastSeen)
+				fw := d.FirmwareVersion
+				if fw == "" {
+					fw = "-"
+				}
+				fmt.Fprintf(w, "%s\t%s\t%v\t%s\t%s\n", d.ID, d.Name, d.Enabled, fw, lastSeen)
 			}
 			return w.Flush()
 		},
@@ -133,6 +139,203 @@ func deviceBindCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&deviceID, "device", "", "Device UUID")
 	cmd.Flags().StringVar(&conversationID, "conversation", "", "Conversation UUID")
+	return cmd
+}
+
+func deviceLogsCmd() *cobra.Command {
+	var deviceID string
+	var limit int
+	cmd := &cobra.Command{
+		Use:   "logs",
+		Short: "Show recent remote logs from a device",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if deviceID == "" {
+				return fmt.Errorf("--device is required")
+			}
+			if err := requireAdmin(); err != nil {
+				return err
+			}
+			ctx := context.Background()
+			svc, pool, err := deviceService(ctx)
+			if err != nil {
+				return err
+			}
+			defer pool.Close()
+
+			logs, err := svc.ListLogs(ctx, deviceID, limit)
+			if err != nil {
+				return err
+			}
+			if len(logs) == 0 {
+				fmt.Println("No logs.")
+				return nil
+			}
+			for i := len(logs) - 1; i >= 0; i-- {
+				e := logs[i]
+				fw := e.FirmwareVersion
+				if fw == "" {
+					fw = "-"
+				}
+				fmt.Printf("%s  %-5s  [%s]  %s\n", e.CreatedAt.Local().Format("2006-01-02 15:04:05"), e.Level, fw, e.Message)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&deviceID, "device", "", "Device UUID")
+	cmd.Flags().IntVar(&limit, "limit", 100, "Number of log lines")
+	return cmd
+}
+
+func firmwareCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "firmware", Short: "Manage OTA firmware releases"}
+	cmd.AddCommand(firmwareUploadCmd(), firmwareListCmd(), firmwareAssignCmd(), firmwareClearCmd())
+	return cmd
+}
+
+func firmwareUploadCmd() *cobra.Command {
+	var version, file string
+	var assignAll bool
+	cmd := &cobra.Command{
+		Use:   "upload",
+		Short: "Upload a firmware .bin to MinIO",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if version == "" || file == "" {
+				return fmt.Errorf("--version and --file are required")
+			}
+			if err := requireAdmin(); err != nil {
+				return err
+			}
+			ctx := context.Background()
+			svc, pool, err := firmwareService(ctx)
+			if err != nil {
+				return err
+			}
+			defer pool.Close()
+
+			rel, err := svc.Upload(ctx, version, file)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Firmware uploaded\n  Version: %s\n  Size:    %d\n  SHA256:  %s\n", rel.Version, rel.SizeBytes, rel.SHA256)
+			if assignAll {
+				n, err := svc.AssignAll(ctx, version)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("Assigned to %d device(s). They will update on the next heartbeat.\n", n)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&version, "version", "", "Firmware version (e.g. 0.2.0)")
+	cmd.Flags().StringVar(&file, "file", "", "Path to firmware.bin from PlatformIO")
+	cmd.Flags().BoolVar(&assignAll, "assign-all", false, "Target every device at this version")
+	return cmd
+}
+
+func firmwareListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "list",
+		Short: "List uploaded firmware releases",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireAdmin(); err != nil {
+				return err
+			}
+			ctx := context.Background()
+			svc, pool, err := firmwareService(ctx)
+			if err != nil {
+				return err
+			}
+			defer pool.Close()
+
+			items, err := svc.List(ctx)
+			if err != nil {
+				return err
+			}
+			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+			fmt.Fprintln(w, "VERSION\tSIZE\tSHA256\tCREATED")
+			for _, rel := range items {
+				sha := rel.SHA256
+				if len(sha) > 12 {
+					sha = sha[:12] + "…"
+				}
+				fmt.Fprintf(w, "%s\t%d\t%s\t%s\n", rel.Version, rel.SizeBytes, sha, rel.CreatedAt.Format("2006-01-02 15:04:05"))
+			}
+			return w.Flush()
+		},
+	}
+}
+
+func firmwareAssignCmd() *cobra.Command {
+	var deviceID, version string
+	var all bool
+	cmd := &cobra.Command{
+		Use:   "assign",
+		Short: "Target a device (or all devices) at a firmware version",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if version == "" {
+				return fmt.Errorf("--version is required")
+			}
+			if !all && deviceID == "" {
+				return fmt.Errorf("--device or --all is required")
+			}
+			if err := requireAdmin(); err != nil {
+				return err
+			}
+			ctx := context.Background()
+			svc, pool, err := firmwareService(ctx)
+			if err != nil {
+				return err
+			}
+			defer pool.Close()
+
+			if all {
+				n, err := svc.AssignAll(ctx, version)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("Assigned %s to %d device(s).\n", version, n)
+				return nil
+			}
+			if err := svc.Assign(ctx, deviceID, version); err != nil {
+				return err
+			}
+			fmt.Printf("Assigned %s to device %s.\n", version, deviceID)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&deviceID, "device", "", "Device UUID")
+	cmd.Flags().StringVar(&version, "version", "", "Firmware version")
+	cmd.Flags().BoolVar(&all, "all", false, "Assign to every device")
+	return cmd
+}
+
+func firmwareClearCmd() *cobra.Command {
+	var deviceID string
+	cmd := &cobra.Command{
+		Use:   "clear",
+		Short: "Stop targeting a device for an OTA update",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if deviceID == "" {
+				return fmt.Errorf("--device is required")
+			}
+			if err := requireAdmin(); err != nil {
+				return err
+			}
+			ctx := context.Background()
+			svc, pool, err := firmwareService(ctx)
+			if err != nil {
+				return err
+			}
+			defer pool.Close()
+			if err := svc.Clear(ctx, deviceID); err != nil {
+				return err
+			}
+			fmt.Println("Firmware assignment cleared.")
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&deviceID, "device", "", "Device UUID")
 	return cmd
 }
 
@@ -230,4 +433,21 @@ func deviceService(ctx context.Context) (*device.Service, interface{ Close() }, 
 		return nil, nil, err
 	}
 	return device.NewService(device.NewRepository(pool)), pool, nil
+}
+
+func firmwareService(ctx context.Context) (*firmware.Service, interface{ Close() }, error) {
+	cfg, err := config.Load()
+	if err != nil {
+		return nil, nil, err
+	}
+	pool, err := database.NewPool(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return nil, nil, err
+	}
+	store, err := storage.NewMinIO(cfg.MinIOEndpoint, cfg.MinIOAccessKey, cfg.MinIOSecretKey, cfg.MinIOBucket, cfg.MinIOUseSSL)
+	if err != nil {
+		pool.Close()
+		return nil, nil, err
+	}
+	return firmware.NewService(firmware.NewRepository(pool), store), pool, nil
 }

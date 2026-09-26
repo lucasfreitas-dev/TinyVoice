@@ -33,6 +33,9 @@ go run ./cmd/tinyvoice device list
 go run ./cmd/tinyvoice conversation create --name "Test" --channel whatsapp --recipient "5511000000001"
 go run ./cmd/tinyvoice conversation create --name "Test TG" --channel telegram --recipient "123456789"
 go run ./cmd/tinyvoice device bind --device <uuid> --conversation <uuid>
+go run ./cmd/tinyvoice device logs --device <uuid>
+go run ./cmd/tinyvoice firmware upload --version 0.2.0 --file ../firmware/tinyvoice/.pio/build/esp32dev/firmware.bin
+go run ./cmd/tinyvoice firmware assign --device <uuid> --version 0.2.0
 ```
 
 ### Tests
@@ -58,6 +61,16 @@ pio run
 pio run -t upload
 pio device monitor
 ```
+
+`FIRMWARE_VERSION` is set in `platformio.ini` / `include/version.h` (currently `0.1.0`). Bump it before each OTA release, then upload the `.bin`:
+
+```bash
+cd backend
+go run ./cmd/tinyvoice firmware upload --version 0.2.0 \
+  --file ../firmware/tinyvoice/.pio/build/esp32dev/firmware.bin --assign-all
+```
+
+The box applies the update on the next heartbeat while idle (no pending inbound message). The default 4 MB partition table has two 1.25 MB app slots; the binary must stay under that.
 
 ### GPIO map
 

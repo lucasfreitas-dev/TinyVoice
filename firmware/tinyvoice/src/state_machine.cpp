@@ -12,6 +12,7 @@ const char* stateToString(DeviceState state) {
         case DeviceState::CHECKING_MESSAGES: return "CHECKING_MESSAGES";
         case DeviceState::DOWNLOADING: return "DOWNLOADING";
         case DeviceState::PLAYING: return "PLAYING";
+        case DeviceState::UPDATING: return "UPDATING";
         case DeviceState::ERROR: return "ERROR";
     }
     return "UNKNOWN";
@@ -110,6 +111,18 @@ void StateMachine::onPlaybackComplete() {
 
 void StateMachine::onRecordingCancelled() {
     transition(DeviceState::IDLE);
+}
+
+void StateMachine::onUpdateStart() {
+    if (_state == DeviceState::IDLE || _state == DeviceState::CHECKING_MESSAGES) {
+        transition(DeviceState::UPDATING);
+    }
+}
+
+void StateMachine::onUpdateFailed() {
+    if (_state == DeviceState::UPDATING) {
+        transition(DeviceState::IDLE);
+    }
 }
 
 void StateMachine::onError(const char* reason) {

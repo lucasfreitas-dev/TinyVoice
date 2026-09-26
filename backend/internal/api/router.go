@@ -9,6 +9,7 @@ import (
 
 	"tinyvoice/backend/internal/api/middleware"
 	"tinyvoice/backend/internal/device"
+	"tinyvoice/backend/internal/firmware"
 	"tinyvoice/backend/internal/message"
 	"tinyvoice/backend/internal/storage"
 )
@@ -16,6 +17,7 @@ import (
 type Deps struct {
 	Devices               *device.Service
 	DeviceRepo            *device.Repository
+	Firmware              *firmware.Service
 	Messages              *message.Service
 	Storage               storage.Provider
 	EvolutionClient       evolutionMediaClient
@@ -33,7 +35,7 @@ func NewRouter(deps Deps) http.Handler {
 
 	r.Get("/health", Health)
 
-	deviceH := NewDeviceHandlers(deps.Devices, deps.Logger)
+	deviceH := NewDeviceHandlers(deps.Devices, deps.Firmware, deps.Logger)
 	msgH := NewMessageHandlers(deps.Messages, deps.DeviceRepo, deps.Storage, deps.Logger)
 	webhookH := NewWebhookHandlers(
 		deps.Messages,
@@ -53,6 +55,8 @@ func NewRouter(deps Deps) http.Handler {
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.DeviceAuth(deps.Devices))
 			r.Post("/device/heartbeat", deviceH.Heartbeat)
+			r.Post("/device/logs", deviceH.Logs)
+			r.Get("/device/firmware/binary", deviceH.FirmwareBinary)
 			r.Get("/device/messages/next", msgH.Next)
 			r.Post("/device/messages", msgH.Upload)
 			r.Get("/device/messages/{id}/audio", msgH.DownloadAudio)

@@ -32,11 +32,19 @@ func VerifyToken(token, hash string) bool {
 }
 
 type Device struct {
-	ID         string
-	Name       string
-	TokenHash  string
-	Enabled    bool
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
-	LastSeenAt *time.Time
+	ID              string
+	Name            string
+	TokenHash       string
+	Enabled         bool
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	LastSeenAt      *time.Time
+	FirmwareVersion string
+}
+
+type RuntimeUpdate struct {
+	FirmwareVersion string
+	RSSI            *int
+	FreeHeap        *int64
+	UptimeMs        *int64
 }

@@ -16,6 +16,7 @@ import (
 	"tinyvoice/backend/internal/conversation"
 	"tinyvoice/backend/internal/database"
 	"tinyvoice/backend/internal/device"
+	"tinyvoice/backend/internal/firmware"
 	"tinyvoice/backend/internal/message"
 	"tinyvoice/backend/internal/messaging"
 	"tinyvoice/backend/internal/messaging/evolution"
@@ -53,6 +54,7 @@ func main() {
 
 	deviceRepo := device.NewRepository(pool)
 	deviceSvc := device.NewService(deviceRepo)
+	fwRepo := firmware.NewRepository(pool)
 	convRepo := conversation.NewRepository(pool)
 	msgRepo := message.NewRepository(pool)
 
@@ -67,6 +69,7 @@ func main() {
 	}
 
 	msgSvc := message.NewService(msgRepo, deviceRepo, convRepo, store)
+	fwSvc := firmware.NewService(fwRepo, store)
 
 	var evolutionClient *evolution.Client
 	if cfg.EvolutionAPIKey != "" {
@@ -81,6 +84,7 @@ func main() {
 	router := api.NewRouter(api.Deps{
 		Devices:               deviceSvc,
 		DeviceRepo:            deviceRepo,
+		Firmware:              fwSvc,
 		Messages:              msgSvc,
 		Storage:               store,
 		EvolutionClient:       evolutionClient,
@@ -123,7 +127,7 @@ func main() {
 		// handler caps the payload size.
 		ReadHeaderTimeout: 15 * time.Second,
 		ReadTimeout:       300 * time.Second,
-		WriteTimeout:      120 * time.Second,
+		WriteTimeout:      180 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 

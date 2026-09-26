@@ -1,17 +1,22 @@
 #include "api_client.h"
 #include "config.h"
 #include "storage_lock.h"
+#include "version.h"
 #include <Arduino.h>
+#include <Update.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <LittleFS.h>
 #include <cstring>
+#include <strings.h>
 #include <HTTPClient.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <lwip/sockets.h>
+#include <mbedtls/sha256.h>
+#include <mbedtls/version.h>
 
 namespace {
 
@@ -815,6 +820,69 @@ bool uploadMultipartRecording(WiFiClientSecure& tls, const uint8_t* wavHeader,
     return code == 201 || code == 200;
 }
 
+void appendLogs(JsonDocument& doc, const char* field, const RemoteLogEntry* logs, int logCount) {
+    if (!logs || logCount <= 0) {
+        return;
+    }
+    JsonArray arr = doc[field].to<JsonArray>();
+    for (int i = 0; i < logCount; i++) {
+        JsonObject e = arr.add<JsonObject>();
+        e["ts_ms"] = logs[i].tsMs;
+        e["level"] = logLevelName(logs[i].level);
+        e["msg"] = logs[i].msg;
+    }
+}
+
+void parseFirmwareOffer(JsonDocument& doc, FirmwareOffer& offer) {
+    offer.updateAvailable = false;
+    offer.version[0] = '\0';
+    offer.sizeBytes = 0;
+    offer.sha256[0] = '\0';
+    JsonObject fw = doc["firmware"].as<JsonObject>();
+    if (fw.isNull()) {
+        return;
+    }
+    offer.updateAvailable = fw["update_available"] | false;
+    strlcpy(offer.version, fw["version"] | "", sizeof(offer.version));
+    offer.sizeBytes = fw["size_bytes"] | 0L;
+    strlcpy(offer.sha256, fw["sha256"] | "", sizeof(offer.sha256));
+}
+
+void sha256Start(mbedtls_sha256_context* ctx) {
+    mbedtls_sha256_init(ctx);
+#if MBEDTLS_VERSION_MAJOR >= 3
+    mbedtls_sha256_starts(ctx, 0);
+#else
+    mbedtls_sha256_starts_ret(ctx, 0);
+#endif
+}
+
+void sha256Add(mbedtls_sha256_context* ctx, const uint8_t* data, size_t len) {
+#if MBEDTLS_VERSION_MAJOR >= 3
+    mbedtls_sha256_update(ctx, data, len);
+#else
+    mbedtls_sha256_update_ret(ctx, data, len);
+#endif
+}
+
+void sha256Finish(mbedtls_sha256_context* ctx, uint8_t out[32]) {
+#if MBEDTLS_VERSION_MAJOR >= 3
+    mbedtls_sha256_finish(ctx, out);
+#else
+    mbedtls_sha256_finish_ret(ctx, out);
+#endif
+    mbedtls_sha256_free(ctx);
+}
+
+void toHexLower(const uint8_t* in, size_t n, char* out) {
+    static const char* hex = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) {
+        out[i * 2] = hex[in[i] >> 4];
+        out[i * 2 + 1] = hex[in[i] & 0x0f];
+    }
+    out[n * 2] = '\0';
+}
+
 }  // namespace
 
 void setApiProgressHook(ApiProgressFn fn) {
@@ -830,13 +898,28 @@ void ApiClient::releaseConnections() {
     releaseClients();
 }
 
-bool ApiClient::heartbeat() {
+bool ApiClient::heartbeat(const RemoteLogEntry* logs, int logCount, FirmwareOffer& offer) {
+    offer.updateAvailable = false;
+    offer.version[0] = '\0';
+    offer.sizeBytes = 0;
+    offer.sha256[0] = '\0';
+
     ApiLock lock;
     if (!lock.held()) {
         return false;
     }
     releaseConnections();
     delay(50);
+
+    JsonDocument req;
+    req["firmware_version"] = FIRMWARE_VERSION;
+    req["uptime_ms"] = millis();
+    req["free_heap"] = ESP.getFreeHeap();
+    req["rssi"] = WiFi.RSSI();
+    appendLogs(req, "logs", logs, logCount);
+
+    String body;
+    serializeJson(req, body);
 
     WiFiClientSecure tls;
     prepareTlsClient(tls);
@@ -850,10 +933,181 @@ bool ApiClient::heartbeat() {
         return false;
     }
     setAuth(http);
-    int code = http.POST("");
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST(body);
     logHttpResult("heartbeat", code);
+    if (code != 200) {
+        finishTls(http, tls);
+        return false;
+    }
+
+    String resp = http.getString();
+    finishTls(http, tls);
+
+    JsonDocument doc;
+    if (!deserializeJson(doc, resp)) {
+        parseFirmwareOffer(doc, offer);
+    }
+    return true;
+}
+
+bool ApiClient::uploadLogs(const RemoteLogEntry* logs, int logCount) {
+    if (!logs || logCount <= 0) {
+        return true;
+    }
+
+    ApiLock lock;
+    if (!lock.held()) {
+        return false;
+    }
+    releaseConnections();
+    delay(50);
+
+    JsonDocument req;
+    req["firmware_version"] = FIRMWARE_VERSION;
+    req["uptime_ms"] = millis();
+    appendLogs(req, "entries", logs, logCount);
+
+    String body;
+    serializeJson(req, body);
+
+    WiFiClientSecure tls;
+    prepareTlsClient(tls);
+
+    HTTPClient http;
+    ApiEndpoint ep = parseEndpoint("/api/v1/device/logs");
+    configureHttp(http);
+    Serial.printf("api: %s:%u%s\n", ep.host.c_str(), ep.port, ep.uri.c_str());
+    if (!http.begin(tls, ep.host, ep.port, ep.uri)) {
+        Serial.println("logs: begin failed");
+        return false;
+    }
+    setAuth(http);
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST(body);
+    logHttpResult("logs", code);
     finishTls(http, tls);
     return code == 200;
+}
+
+bool ApiClient::downloadAndApplyFirmware(const FirmwareOffer& offer) {
+    ApiLock lock;
+    if (!lock.held()) {
+        return false;
+    }
+    releaseConnections();
+    delay(200);
+
+    WiFiClientSecure tls;
+    prepareTlsClient(tls);
+
+    HTTPClient http;
+    ApiEndpoint ep = parseEndpoint("/api/v1/device/firmware/binary");
+    configureHttpDownload(http);
+    http.setTimeout(180000);
+    Serial.printf("api: %s:%u%s\n", ep.host.c_str(), ep.port, ep.uri.c_str());
+    if (!http.begin(tls, ep.host, ep.port, ep.uri)) {
+        Serial.println("ota: begin failed");
+        return false;
+    }
+    setAuth(http);
+    int code = http.GET();
+    if (code != 200) {
+        logHttpResult("ota", code);
+        finishTls(http, tls);
+        return false;
+    }
+
+    int len = http.getSize();
+    if (len <= 0) {
+        len = (int)offer.sizeBytes;
+    }
+    if (len <= 0 || len > 0x140000) {
+        Serial.printf("ota: bad size %d\n", len);
+        finishTls(http, tls);
+        return false;
+    }
+
+    Serial.printf("ota: downloading %d bytes version=%s\n", len, offer.version);
+    if (!Update.begin((size_t)len, U_FLASH)) {
+        Serial.printf("ota: Update.begin failed (err=%u)\n", (unsigned)Update.getError());
+        finishTls(http, tls);
+        return false;
+    }
+
+    mbedtls_sha256_context sha;
+    sha256Start(&sha);
+
+    WiFiClient* stream = http.getStreamPtr();
+    size_t received = 0;
+    unsigned long lastData = millis();
+    size_t nextLog = 32768;
+    bool ok = true;
+
+    while (received < (size_t)len) {
+        size_t want = sizeof(s_bodyBuf);
+        if (want > (size_t)len - received) {
+            want = (size_t)len - received;
+        }
+        int n = stream->read(s_bodyBuf, want);
+        if (n > 0) {
+            if (Update.write(s_bodyBuf, (size_t)n) != (size_t)n) {
+                Serial.printf("ota: flash write failed at %u (err=%u)\n",
+                              (unsigned)received, (unsigned)Update.getError());
+                ok = false;
+                break;
+            }
+            sha256Add(&sha, s_bodyBuf, (size_t)n);
+            received += (size_t)n;
+            lastData = millis();
+            if (received >= nextLog) {
+                Serial.printf("ota: %u/%d bytes (heap=%u)\n",
+                              (unsigned)received, len, ESP.getFreeHeap());
+                nextLog += 65536;
+            }
+            apiProgressTick();
+            continue;
+        }
+        if (stream->available() <= 0 && !stream->connected()) {
+            Serial.printf("ota: peer closed at %u/%d\n", (unsigned)received, len);
+            ok = false;
+            break;
+        }
+        if (millis() - lastData > 20000) {
+            Serial.println("ota: stalled");
+            ok = false;
+            break;
+        }
+        apiProgressTick();
+        delay(2);
+    }
+
+    uint8_t digest[32];
+    sha256Finish(&sha, digest);
+    char hex[65];
+    toHexLower(digest, 32, hex);
+
+    finishTls(http, tls);
+
+    if (!ok || received != (size_t)len) {
+        Update.abort();
+        return false;
+    }
+    if (offer.sha256[0] && strcasecmp(offer.sha256, hex) != 0) {
+        Serial.printf("ota: sha256 mismatch got %s want %s\n", hex, offer.sha256);
+        Update.abort();
+        return false;
+    }
+
+    if (!Update.end()) {
+        Serial.printf("ota: Update.end failed (err=%u)\n", (unsigned)Update.getError());
+        return false;
+    }
+
+    Serial.printf("ota: applied %s sha256=%s, rebooting\n", offer.version, hex);
+    delay(250);
+    ESP.restart();
+    return true;
 }
 
 bool ApiClient::pollNext(NextMessage& out) {

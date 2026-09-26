@@ -58,6 +58,10 @@ cd backend && go run ./cmd/tinyvoice device bind --device <device-id> --conversa
 
 Save the device token — it is shown only once.
 
+Remote logs: `go run ./cmd/tinyvoice device logs --device <device-id>`
+
+OTA: build firmware, bump `FIRMWARE_VERSION`, then `go run ./cmd/tinyvoice firmware upload --version 0.2.0 --file ../firmware/tinyvoice/.pio/build/esp32dev/firmware.bin --assign-all`. The box updates on the next heartbeat while idle.
+
 ### 7. Configure ESP32
 
 ```bash

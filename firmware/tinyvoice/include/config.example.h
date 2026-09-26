@@ -9,6 +9,9 @@
 #define DEVICE_ID "00000000-0000-0000-0000-000000000000"
 #define DEVICE_TOKEN "your-device-token"
 
+// Firmware version for remote logs / OTA is FIRMWARE_VERSION in version.h
+// and platformio.ini — bump it before each OTA release.
+
 // Recording limits
 #define MIN_RECORDING_MS 500
 #define MAX_RECORDING_SECONDS 60

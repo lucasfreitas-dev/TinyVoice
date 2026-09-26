@@ -11,7 +11,10 @@
 #include "led.h"
 #include "config.h"
 #include "storage_lock.h"
+#include "remote_log.h"
+#include "version.h"
 #include <WiFi.h>
+#include <esp_system.h>
 
 StateMachine stateMachine;
 WiFiManager wifiManager;
@@ -71,7 +74,18 @@ static void requestUpload(const uint8_t* wavHeader, size_t pcmBytes, int chunkCo
     s_uploadRequested = true;
 }
 
-enum class NetJob : uint8_t { NONE, POLL, DOWNLOAD, MARK_PLAYED, HEARTBEAT };
+enum class NetJob : uint8_t { NONE, POLL, DOWNLOAD, MARK_PLAYED, HEARTBEAT, LOGS, OTA };
+
+static RemoteLogEntry s_logBatch[24];
+static int s_logBatchCount = 0;
+static FirmwareOffer s_firmwareOffer = {};
+static bool s_otaPending = false;
+static unsigned long s_otaRetryAfter = 0;
+static volatile bool s_otaTaskDone = false;
+static volatile bool s_otaOk = false;
+static volatile bool s_logsTaskDone = false;
+static volatile bool s_logsOk = false;
+static FirmwareOffer s_heartbeatOffer = {};
 
 // A single long-lived worker owns every background TLS call. Creating a task per poll or
 // per download meant a tight heap could refuse the allocation, which is what left inbound
@@ -129,10 +143,12 @@ static void runUploadJob() {
 
     if (ok) {
         s_uploadRetryAfter = 0;
+        TV_LOG("upload: ok (%u bytes)", (unsigned)(44 + s_uploadJob.pcmBytes));
         stateMachine.onUploadSuccess();
         audioRecorder.cleanupRecording();
     } else {
         s_uploadRetryAfter = millis() + 30000;
+        TV_ERROR("upload: failed (%u bytes)", (unsigned)(44 + s_uploadJob.pcmBytes));
         apiClient.releaseConnections();
         delay(500);
         stateMachine.onUploadFailed();
@@ -253,10 +269,25 @@ void processQueue() {
     root.close();
 }
 
+static const char* resetReasonName(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON: return "poweron";
+        case ESP_RST_SW: return "software";
+        case ESP_RST_PANIC: return "panic";
+        case ESP_RST_INT_WDT: return "int_wdt";
+        case ESP_RST_TASK_WDT: return "task_wdt";
+        case ESP_RST_WDT: return "wdt";
+        case ESP_RST_BROWNOUT: return "brownout";
+        case ESP_RST_SDIO: return "sdio";
+        default: return "other";
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println("TinyVoice boot");
+    TV_LOG("TinyVoice boot version=%s reset=%s heap=%u",
+           FIRMWARE_VERSION, resetReasonName(esp_reset_reason()), ESP.getFreeHeap());
 
     button.begin();
     led.begin();
@@ -289,16 +320,17 @@ void setup() {
     if (wifiManager.connect()) {
         stateMachine.onWiFiConnected();
     } else {
+        TV_ERROR("wifi: connect failed");
         stateMachine.onWiFiFailed();
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("wifi: connected, ip=%s\n", WiFi.localIP().toString().c_str());
-        Serial.printf("api target: %s\n", API_BASE_URL);
+        TV_LOG("wifi: connected ip=%s rssi=%d api=%s",
+               WiFi.localIP().toString().c_str(), WiFi.RSSI(), API_BASE_URL);
         setApiProgressHook(uploadProgressTick);
         startNetWorker();
         lastPollMs = millis() - POLL_INTERVAL_MS;
-        lastHeartbeatMs = millis();
+        lastHeartbeatMs = millis() - 60000;
     }
 
     led.update(stateMachine.current(), stateMachine.hasPendingMessage());
@@ -396,9 +428,9 @@ static void runDownloadJob() {
     if (ok) {
         stateMachine.onDownloadComplete();
         s_inboundReady = true;
-        Serial.println("download: file ready");
+        TV_LOG("download: ready id=%s", s_downloadMessageId);
     } else {
-        Serial.println("download: failed");
+        TV_ERROR("download: failed id=%s", s_downloadMessageId);
         stateMachine.onDownloadFailed();
     }
 
@@ -418,12 +450,20 @@ static void netTaskEntry(void* arg) {
             s_pollOk = apiClient.pollNext(s_pollMsg);
             s_pollTaskDone = true;
         } else if (job == NetJob::HEARTBEAT) {
-            s_heartbeatOk = apiClient.heartbeat();
+            s_logBatchCount = remoteLogCopyPending(s_logBatch, 24);
+            s_heartbeatOffer = {};
+            s_heartbeatOk = apiClient.heartbeat(s_logBatch, s_logBatchCount, s_heartbeatOffer);
             s_heartbeatTaskDone = true;
         } else if (job == NetJob::MARK_PLAYED) {
             if (apiClient.markPlayed(s_downloadMessageId)) {
                 s_downloadMessageId[0] = '\0';
             }
+        } else if (job == NetJob::LOGS) {
+            s_logsOk = apiClient.uploadLogs(s_logBatch, s_logBatchCount);
+            s_logsTaskDone = true;
+        } else if (job == NetJob::OTA) {
+            s_otaOk = apiClient.downloadAndApplyFirmware(s_firmwareOffer);
+            s_otaTaskDone = true;
         } else {
             runDownloadJob();
         }
@@ -442,7 +482,7 @@ static void startNetWorker() {
     BaseType_t created = xTaskCreatePinnedToCore(
         netTaskEntry,
         "net",
-        8192,
+        16384,
         nullptr,
         2,
         &s_netTask,
@@ -521,14 +561,14 @@ void loop() {
 
     // Recover from ERROR once Wi-Fi is back
     if (state == DeviceState::ERROR && wifiManager.isConnected()) {
-        Serial.println("wifi recovered, back to IDLE");
+        TV_LOG("wifi recovered, back to IDLE");
         stateMachine.onWiFiConnected();
         state = stateMachine.current();
         led.update(state, stateMachine.hasPendingMessage());
     }
 
     if (!wifiManager.isConnected()) {
-        if (state != DeviceState::ERROR) {
+        if (state != DeviceState::ERROR && state != DeviceState::UPDATING) {
             stateMachine.onWiFiFailed();
             led.update(stateMachine.current(), stateMachine.hasPendingMessage());
         }
@@ -541,7 +581,8 @@ void loop() {
         state != DeviceState::RECORDING &&
         state != DeviceState::PROCESSING &&
         state != DeviceState::UPLOADING &&
-        state != DeviceState::DOWNLOADING) {
+        state != DeviceState::DOWNLOADING &&
+        state != DeviceState::UPDATING) {
         led.setPressedHint(button.isPressed());
     } else {
         led.setPressedHint(false);
@@ -591,7 +632,7 @@ void loop() {
                 audioRecorder.disarm();
                 stateMachine.onRecordingCancelled();
             } else {
-                Serial.println("recording started");
+                TV_LOG("recording started");
             }
             led.update(stateMachine.current(), stateMachine.hasPendingMessage());
         }
@@ -612,6 +653,29 @@ void loop() {
     }
 
     handleInboundPlayback();
+
+    if (s_logsTaskDone) {
+        s_logsTaskDone = false;
+        if (s_logsOk) {
+            remoteLogConsume(s_logBatchCount);
+            noteApiSuccess();
+        } else {
+            noteApiFailure();
+        }
+        s_logBatchCount = 0;
+    }
+
+    if (s_otaTaskDone) {
+        s_otaTaskDone = false;
+        if (!s_otaOk) {
+            TV_ERROR("ota: failed version=%s", s_firmwareOffer.version);
+            s_otaPending = false;
+            s_otaRetryAfter = millis() + 900000;
+            stateMachine.onUpdateFailed();
+            led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+            noteApiFailure();
+        }
+    }
 
     if (s_pollTaskDone) {
         s_pollTaskDone = false;
@@ -645,6 +709,7 @@ void loop() {
                 stateMachine.onPollComplete(false);
             }
         } else {
+            TV_WARN("poll: failed");
             noteApiFailure();
             stateMachine.onPollComplete(stateMachine.hasPendingMessage());
         }
@@ -654,10 +719,22 @@ void loop() {
     if (s_heartbeatTaskDone) {
         s_heartbeatTaskDone = false;
         if (s_heartbeatOk) {
+            if (s_logBatchCount > 0) {
+                remoteLogConsume(s_logBatchCount);
+            }
             noteApiSuccess();
+            if (s_heartbeatOffer.updateAvailable) {
+                s_firmwareOffer = s_heartbeatOffer;
+                s_otaPending = true;
+                TV_LOG("ota: offered %s (%ld bytes)",
+                       s_heartbeatOffer.version, s_heartbeatOffer.sizeBytes);
+            } else {
+                s_otaPending = false;
+            }
         } else {
             noteApiFailure();
         }
+        s_logBatchCount = 0;
     }
 
     // Heartbeat every 60s — same worker as poll so TLS never overlaps.
@@ -668,12 +745,57 @@ void loop() {
         stateMachine.current() != DeviceState::PLAYING &&
         stateMachine.current() != DeviceState::RECORDING &&
         stateMachine.current() != DeviceState::PROCESSING &&
+        stateMachine.current() != DeviceState::UPDATING &&
         !buttonActive &&
         !s_netBusy &&
         millis() - lastHeartbeatMs > 60000) {
         lastHeartbeatMs = millis();
         s_heartbeatTaskDone = false;
         requestNetJob(NetJob::HEARTBEAT);
+    }
+
+    if (apiCallsAllowed() &&
+        wifiManager.isConnected() &&
+        stateMachine.current() == DeviceState::IDLE &&
+        !buttonActive &&
+        !s_netBusy &&
+        !s_uploadRequested &&
+        remoteLogAlmostFull() &&
+        millis() >= s_uploadRetryAfter) {
+        s_logBatchCount = remoteLogCopyPending(s_logBatch, 24);
+        s_logsTaskDone = false;
+        if (s_logBatchCount > 0 && !requestNetJob(NetJob::LOGS)) {
+            s_logBatchCount = 0;
+        }
+    }
+
+    if (s_otaPending &&
+        apiCallsAllowed() &&
+        wifiManager.isConnected() &&
+        stateMachine.current() == DeviceState::IDLE &&
+        !stateMachine.hasPendingMessage() &&
+        !audioRecorder.hasPendingRecording() &&
+        !buttonActive &&
+        !s_netBusy &&
+        !s_uploadRequested &&
+        !s_inboundReady &&
+        millis() >= s_otaRetryAfter &&
+        millis() >= s_uploadRetryAfter) {
+        stateMachine.onUpdateStart();
+        if (stateMachine.current() == DeviceState::UPDATING) {
+            TV_LOG("ota: starting %s", s_firmwareOffer.version);
+            led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+            waitForNetIdle(30000);
+            apiClient.releaseConnections();
+            audioRecorder.releaseMemoryForNetwork();
+            delay(200);
+            s_otaTaskDone = false;
+            if (!requestNetJob(NetJob::OTA)) {
+                TV_ERROR("ota: worker busy");
+                stateMachine.onUpdateFailed();
+                led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+            }
+        }
     }
 
     // Poll for messages in background so button stays responsive
