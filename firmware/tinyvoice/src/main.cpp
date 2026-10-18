@@ -44,6 +44,18 @@ static unsigned long s_uploadRetryAfter = 0;
 static unsigned long s_apiBackoffUntil = 0;
 static int s_apiFailStreak = 0;
 
+static const char* INBOUND_PLAY_PATH = "/play.wav";
+static volatile bool s_downloadTaskDone = false;
+static volatile bool s_inboundReady = false;  // WAV cached; LED + ringtone fire here
+static volatile bool s_inboundTrimmed = false;
+static volatile bool s_downloadOk = false;
+static char s_downloadMessageId[40] = {0};
+
+// LED breathe only after the inbound file is cached and waiting for a press.
+static void updateLed() {
+    led.update(stateMachine.current(), s_inboundReady);
+}
+
 static void noteApiSuccess() {
     s_apiFailStreak = 0;
     s_apiBackoffUntil = 0;
@@ -137,7 +149,7 @@ static void runUploadJob() {
         delay(500);
         stateMachine.onUploadFailed();
     }
-    led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+    updateLed();
     Serial.printf("state: %s\n", stateToString(stateMachine.current()));
 }
 
@@ -146,7 +158,7 @@ void handleUploading() {
         return;
     }
     s_uploadRequested = false;
-    led.update(DeviceState::UPLOADING, stateMachine.hasPendingMessage());
+    led.update(DeviceState::UPLOADING, s_inboundReady);
     runUploadJob();
 }
 
@@ -272,7 +284,7 @@ void setup() {
     }
 
     stateMachine.onBootComplete();
-    led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+    updateLed();
 
     // Grab the recording buffer before Wi-Fi consumes contiguous heap.
     if (!audioRecorder.begin()) {
@@ -301,7 +313,7 @@ void setup() {
         lastHeartbeatMs = millis();
     }
 
-    led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+    updateLed();
     Serial.printf("state: %s\n", stateToString(stateMachine.current()));
 }
 
@@ -321,7 +333,7 @@ bool uploadPendingRecording() {
     audioRecorder.buildWavHeader(wavHeader, pcmBytes);
     requestUpload(wavHeader, pcmBytes, audioRecorder.chunkCount());
     stateMachine.onUploadStart();
-    led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+    updateLed();
     return true;
 }
 
@@ -338,7 +350,7 @@ void handleRecording() {
         }
         // Fast pulse while stop() drains the ring and flushes LittleFS.
         stateMachine.onButtonRelease();
-        led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+        updateLed();
         Serial.printf("state: %s\n", stateToString(stateMachine.current()));
         size_t fileLen = 0;
         size_t pcmBytes = audioRecorder.stop(&fileLen);
@@ -363,16 +375,9 @@ void handleRecording() {
             stateMachine.onRecordingCancelled();
         }
 
-        led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+        updateLed();
     }
 }
-
-static const char* INBOUND_PLAY_PATH = "/play.wav";
-
-static volatile bool s_downloadTaskDone = false;
-static volatile bool s_inboundReady = false;
-static volatile bool s_inboundTrimmed = false;
-static char s_downloadMessageId[40] = {0};
 
 static volatile bool s_pollTaskDone = false;
 static bool s_pollOk = false;
@@ -393,13 +398,11 @@ static void runDownloadJob() {
     bool ok = apiClient.downloadAudioToFile(s_downloadMessageId, INBOUND_PLAY_PATH, &trimmed);
     s_inboundTrimmed = trimmed;
 
-    if (ok) {
-        stateMachine.onDownloadComplete();
-        s_inboundReady = true;
-        Serial.println("download: file ready");
-    } else {
+    s_downloadOk = ok;
+    if (!ok) {
         Serial.println("download: failed");
-        stateMachine.onDownloadFailed();
+    } else {
+        Serial.println("download: file ready");
     }
 
     s_downloadTaskDone = true;
@@ -454,14 +457,14 @@ static void startNetWorker() {
     }
 }
 
-static void handleInboundPlayback() {
+static void playCachedInbound() {
     if (!s_inboundReady) {
         return;
     }
     s_inboundReady = false;
 
     led.setTrimHint(s_inboundTrimmed);
-    led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+    updateLed();
     if (s_inboundTrimmed) {
         Serial.println("playback: message was trimmed to fit flash");
     }
@@ -477,7 +480,7 @@ static void handleInboundPlayback() {
     s_inboundTrimmed = false;
     led.setTrimHint(false);
     stateMachine.onPlaybackComplete();
-    led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+    updateLed();
     Serial.println("playback: complete");
 
     // Acking runs on the worker: a blocking TLS call here would freeze the state machine.
@@ -486,25 +489,33 @@ static void handleInboundPlayback() {
     }
 }
 
-static void startDownloadAndPlay() {
+static bool startInboundDownload() {
     if (pendingMessageId[0] == '\0') {
         Serial.println("download: no message id");
-        stateMachine.onDownloadFailed();
-        return;
+        return false;
     }
-    strlcpy(s_downloadMessageId, pendingMessageId, sizeof(s_downloadMessageId));
+    if (s_inboundReady) {
+        return true;
+    }
+    if (s_netBusy || stateMachine.current() == DeviceState::DOWNLOADING) {
+        return false;
+    }
 
-    // A poll may be in flight; it finishes in a few seconds and both share the worker.
-    waitForNetIdle(30000);
+    strlcpy(s_downloadMessageId, pendingMessageId, sizeof(s_downloadMessageId));
+    stateMachine.onDownloadStart();
+    if (stateMachine.current() != DeviceState::DOWNLOADING) {
+        return false;
+    }
+    updateLed();
     s_downloadTaskDone = false;
+    s_downloadOk = false;
     if (!requestNetJob(NetJob::DOWNLOAD)) {
         Serial.println("download: worker busy");
         stateMachine.onDownloadFailed();
+        updateLed();
+        return false;
     }
-}
-
-void handleDownloadAndPlay() {
-    startDownloadAndPlay();
+    return true;
 }
 
 void loop() {
@@ -524,13 +535,13 @@ void loop() {
         Serial.println("wifi recovered, back to IDLE");
         stateMachine.onWiFiConnected();
         state = stateMachine.current();
-        led.update(state, stateMachine.hasPendingMessage());
+        led.update(state, s_inboundReady);
     }
 
     if (!wifiManager.isConnected()) {
         if (state != DeviceState::ERROR) {
             stateMachine.onWiFiFailed();
-            led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+            updateLed();
         }
     }
 
@@ -562,21 +573,21 @@ void loop() {
         audioRecorder.disarm();
     }
 
-    // Pending inbound: tap or hold plays. A hold must not record instead.
+    // Pending inbound: tap or hold plays once the file is cached.
+    // A hold must not start a recording while a message is waiting.
     if (stateMachine.hasPendingMessage() &&
         (button.wasShortPress() || button.wasJustHeld())) {
         DeviceState playState = stateMachine.current();
-        if (playState == DeviceState::DOWNLOADING ||
-            playState == DeviceState::PLAYING ||
-            s_inboundReady) {
-            Serial.println("button: play ignored, already playing");
-        } else {
+        if (playState == DeviceState::DOWNLOADING || playState == DeviceState::PLAYING) {
+            Serial.println("button: play ignored, busy");
+        } else if (s_inboundReady) {
             Serial.println("button: play requested");
             stateMachine.onButtonShortPress();
-            if (stateMachine.current() == DeviceState::DOWNLOADING) {
-                handleDownloadAndPlay();
-                led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+            if (stateMachine.current() == DeviceState::PLAYING) {
+                playCachedInbound();
             }
+        } else {
+            Serial.println("button: message still downloading");
         }
     }
 
@@ -593,7 +604,7 @@ void loop() {
             } else {
                 Serial.println("recording started");
             }
-            led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+            updateLed();
         }
     }
 
@@ -608,10 +619,21 @@ void loop() {
 
     if (s_downloadTaskDone) {
         s_downloadTaskDone = false;
-        led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+        if (s_downloadOk) {
+            stateMachine.onDownloadComplete();
+            s_inboundReady = true;
+            // Notify only when the WAV is on flash and ready to play.
+            if (strcmp(announcedMessageId, s_downloadMessageId) != 0) {
+                strlcpy(announcedMessageId, s_downloadMessageId, sizeof(announcedMessageId));
+                audioPlayer.playRingtone();
+            }
+            Serial.println("inbound: ready to play");
+        } else {
+            stateMachine.onDownloadFailed();
+            s_inboundReady = false;
+        }
+        updateLed();
     }
-
-    handleInboundPlayback();
 
     if (s_pollTaskDone) {
         s_pollTaskDone = false;
@@ -628,27 +650,34 @@ void loop() {
                     requestNetJob(NetJob::MARK_PLAYED);
                     stateMachine.onPollComplete(false);
                 } else {
-                    bool isNew = strcmp(announcedMessageId, s_pollMsg.id) != 0;
+                    bool sameId = strcmp(pendingMessageId, s_pollMsg.id) == 0;
                     strlcpy(pendingMessageId, s_pollMsg.id, sizeof(pendingMessageId));
                     Serial.printf("poll: message available id=%s\n", pendingMessageId);
-                    if (isNew) {
-                        strlcpy(announcedMessageId, s_pollMsg.id, sizeof(announcedMessageId));
-                        audioPlayer.playRingtone();
-                    } else {
-                        Serial.printf("poll: still waiting to play id=%s\n", pendingMessageId);
+                    if (!sameId && s_inboundReady) {
+                        // A different message arrived — drop the old cache.
+                        LittleFS.remove(INBOUND_PLAY_PATH);
+                        s_inboundReady = false;
+                        announcedMessageId[0] = '\0';
+                    } else if (sameId && s_inboundReady) {
+                        Serial.printf("poll: still ready to play id=%s\n", pendingMessageId);
                     }
                     stateMachine.onPollComplete(true);
                 }
             } else {
                 Serial.printf("poll: no message (free=%u max=%u)\n",
                               ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+                if (s_inboundReady) {
+                    LittleFS.remove(INBOUND_PLAY_PATH);
+                    s_inboundReady = false;
+                }
+                pendingMessageId[0] = '\0';
                 stateMachine.onPollComplete(false);
             }
         } else {
             noteApiFailure();
             stateMachine.onPollComplete(stateMachine.hasPendingMessage());
         }
-        led.update(stateMachine.current(), stateMachine.hasPendingMessage());
+        updateLed();
     }
 
     if (s_heartbeatTaskDone) {
@@ -691,12 +720,25 @@ void loop() {
         requestNetJob(NetJob::POLL);
     }
 
+    // Prefetch inbound audio as soon as poll reports a message.
+    if (!buttonActive &&
+        stateMachine.hasPendingMessage() &&
+        !s_inboundReady &&
+        stateMachine.current() == DeviceState::IDLE &&
+        wifiManager.isConnected() &&
+        apiCallsAllowed() &&
+        !s_uploadRequested &&
+        !s_netBusy) {
+        startInboundDownload();
+    }
+
     // Retry pending chunk recording or legacy queue uploads when idle
     if (!buttonActive &&
         stateMachine.current() == DeviceState::IDLE &&
         wifiManager.isConnected() &&
         !s_uploadRequested &&
-        !s_netBusy) {
+        !s_netBusy &&
+        !stateMachine.hasPendingMessage()) {
         if (!uploadPendingRecording()) {
             processQueue();
         }

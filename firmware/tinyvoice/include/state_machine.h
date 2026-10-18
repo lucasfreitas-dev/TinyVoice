@@ -33,6 +33,7 @@ public:
     void onPollComplete(bool messageAvailable);
     void onUploadSuccess();
     void onUploadFailed();
+    void onDownloadStart();
     void onDownloadComplete();
     void onDownloadFailed();
     void onPlaybackComplete();

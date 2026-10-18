@@ -69,7 +69,14 @@ void StateMachine::onUploadStart() {
 }
 
 void StateMachine::onButtonShortPress() {
+    // Play starts only when the inbound file is already on flash (handled in main).
     if (_hasPendingMessage && (_state == DeviceState::IDLE || _state == DeviceState::CHECKING_MESSAGES)) {
+        transition(DeviceState::PLAYING);
+    }
+}
+
+void StateMachine::onDownloadStart() {
+    if (_state == DeviceState::IDLE || _state == DeviceState::CHECKING_MESSAGES) {
         transition(DeviceState::DOWNLOADING);
     }
 }
@@ -96,11 +103,16 @@ void StateMachine::onUploadFailed() {
 }
 
 void StateMachine::onDownloadComplete() {
-    transition(DeviceState::PLAYING);
+    // File is cached; wait for a button press to play.
+    if (_state == DeviceState::DOWNLOADING) {
+        transition(DeviceState::IDLE);
+    }
 }
 
 void StateMachine::onDownloadFailed() {
-    transition(DeviceState::IDLE);
+    if (_state == DeviceState::DOWNLOADING) {
+        transition(DeviceState::IDLE);
+    }
 }
 
 void StateMachine::onPlaybackComplete() {
